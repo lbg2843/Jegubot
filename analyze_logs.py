@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import io
+import argparse
 import json
 import re
 import sys
@@ -103,7 +104,12 @@ def _fmt_usd(value: float | None) -> str:
     return f'<span class="{cls}">{sign}${value:.2f}</span>'
 
 
-def _candidate_rows(candidates: list[dict], snapshots: dict[str, dict[str, list[dict]]]) -> list[dict]:
+def _candidate_rows(
+    candidates: list[dict],
+    snapshots: dict[str, dict[str, list[dict]]],
+    *,
+    profit_lock_enabled: bool,
+) -> list[dict]:
     rows: list[dict] = []
     for candidate in candidates:
         series = snapshots.get(candidate["chain"], {}).get(candidate["symbol"], [])
@@ -112,7 +118,9 @@ def _candidate_rows(candidates: list[dict], snapshots: dict[str, dict[str, list[
             continue
         entry_snapshot = dict(entry_snapshot)
         entry_snapshot["_position_size_usd"] = position_size_usd_for_chain(candidate["chain"])
-        trade = simulate_trade(entry_snapshot, series_from_entry(series, candidate["ts"]), params_for_chain(candidate["chain"]))
+        params = params_for_chain(candidate["chain"])
+        params.profit_lock_enabled = profit_lock_enabled
+        trade = simulate_trade(entry_snapshot, series_from_entry(series, candidate["ts"]), params)
         rows.append(
             {
                 "candidate": candidate,
@@ -189,13 +197,21 @@ def build_html_report(candidate_rows: list[dict], metrics, gap_stats: dict, cycl
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-profit-lock", action="store_true", help="Use original immediate take-profit behavior.")
+    args = parser.parse_args()
+
     print("=== Jegubot unified analysis ===")
 
     snapshots = load_all_snapshots(DATA_DIR)
     candidates = load_candidates_from_log(LOG_FILE)
     cycles, errors = parse_log_diagnostics(LOG_FILE)
 
-    candidate_rows = _candidate_rows(candidates, snapshots)
+    candidate_rows = _candidate_rows(
+        candidates,
+        snapshots,
+        profit_lock_enabled=not args.no_profit_lock,
+    )
     trades = [row["trade"] for row in candidate_rows]
     metrics = compute_metrics(trades)
 
@@ -207,6 +223,8 @@ def main() -> None:
     print(f"Wins: {metrics.wins}")
     print(f"Total PnL: ${metrics.total_pnl_usd:+.2f}")
     print(f"Average PnL per closed trade: ${metrics.avg_pnl_usd:+.2f}")
+    print(f"Profit lock enabled: {not args.no_profit_lock}")
+    print(f"Exit reasons: {metrics.by_exit_reason}")
     print(f"HTML report: {REPORT_FILE}")
 
 
