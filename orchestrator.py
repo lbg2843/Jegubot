@@ -38,6 +38,7 @@ from mc_position_manager import (
     PortfolioConfig,
     ExitReason,
 )
+from notifier import format_entry_alert, format_exit_alert, format_summary_alert
 
 
 _BASE_DIR = Path(__file__).parent
@@ -69,6 +70,9 @@ CONFIG = {
     "telegram": {
         "bot_token": None,  # os.getenv("TELEGRAM_BOT_TOKEN")
         "chat_id": None,    # os.getenv("TELEGRAM_CHAT_ID")
+        "alert_entry": True,
+        "alert_exit": True,
+        "alert_summary_interval": 4,
     },
     "data_dir": str(_BASE_DIR / "data"),
     "scraper_schedule": {
@@ -224,6 +228,7 @@ class Orchestrator:
         )
 
         self.last_scrape: dict[str, float] = {"bsc": 0, "solana": 0, "base": 0}
+        self.last_summary_bucket: str | None = None
         if self.dry_run:
             log.info("[DRY-RUN] 포지션 진입/청산 알림 비활성화")
 
@@ -314,6 +319,7 @@ class Orchestrator:
     # --------------------------------------------------------
 
     def run_cycle(self):
+        cycle_started_at = datetime.now()
         log.info("=" * 60)
         log.info("사이클 시작")
         log.info("=" * 60)
@@ -333,9 +339,10 @@ class Orchestrator:
         # 2. 기존 포지션 업데이트 + 청산
         exits = self.pm.update_all(snapshots_by_chain)
         for pos, reason, msg in exits:
+            current_price = pos.current_price
             if not self.dry_run:
-                self.pm.close_position(pos, reason, msg)
-                self._notify_exit(pos, reason)
+                closed_pos = self.pm.close_position(pos, reason, msg)
+                self._notify_exit(closed_pos, reason, current_price, cycle_started_at)
             else:
                 log.info(f"[DRY-RUN] 청산 스킵: {pos.symbol} ({reason})")
 
@@ -357,7 +364,7 @@ class Orchestrator:
                         total_capital_usd=self.config["total_capital_usd"]
                     )
                     if pos:
-                        self._notify_entry(pos)
+                        self._notify_entry(cand, pos)
                 else:
                     log.info(
                         f"[DRY-RUN] 진입 후보: [{chain.upper()}] {cand['symbol']} "
@@ -366,31 +373,94 @@ class Orchestrator:
                         f"liq=${cand.get('liquidity_usd', 0)/1000:.0f}K "
                         f"txns={cand.get('txns_1h', 0)}"
                     )
+                    preview = format_entry_alert(
+                        cand,
+                        chain,
+                        self._recommended_position_size_usd(chain),
+                        self.pm.chain_configs[chain],
+                    )
+                    log.info("[DRY-RUN] Telegram ENTRY preview:\n%s", preview)
 
         # 4. 리포트
+        self._maybe_send_summary(cycle_started_at)
         log.info("\n" + self.pm.summary())
         log.info("사이클 종료\n")
 
-    def _notify_entry(self, pos):
-        msg = (
-            f"<b>▶ 진입</b> [{pos.chain.upper()}]\n"
-            f"Symbol: <code>{pos.symbol}</code>\n"
-            f"Price: ${pos.entry_price:.6f}\n"
-            f"Size: ${pos.size_usd:.0f}\n"
-            f"Liquidity: ${pos.entry_liquidity/1000:.0f}K"
+    def _recommended_position_size_usd(self, chain: str) -> float:
+        cfg = self.pm.chain_configs[chain]
+        return self.config["total_capital_usd"] * (cfg.capital_per_position_pct / 100.0)
+
+    def _notify_entry(self, snapshot: dict, pos):
+        if not self.config["telegram"]["alert_entry"]:
+            return
+        msg = format_entry_alert(
+            snapshot,
+            pos.chain,
+            pos.size_usd,
+            self.pm.chain_configs[pos.chain],
         )
+        if len(msg) > 4096:
+            msg = msg[:4090] + "..."
         send_telegram(msg, self.config)
 
-    def _notify_exit(self, pos, reason):
-        icon = "✅" if pos.realized_pnl_pct > 0 else "❌"
-        msg = (
-            f"{icon} <b>청산</b> [{pos.chain.upper()}]\n"
-            f"Symbol: <code>{pos.symbol}</code>\n"
-            f"PnL: {pos.realized_pnl_pct:+.2f}% (${pos.realized_pnl_usd:+.2f})\n"
-            f"Reason: {reason.value}\n"
-            f"Hold: {pos.hold_hours:.1f}h"
-        )
+    def _notify_exit(self, pos, reason, current_price: float, current_timestamp: datetime):
+        if not self.config["telegram"]["alert_exit"]:
+            return
+        msg = format_exit_alert(pos, reason, current_price, current_timestamp)
+        if len(msg) > 4096:
+            msg = msg[:4090] + "..."
         send_telegram(msg, self.config)
+
+    def _realized_today_usd(self, as_of: datetime) -> float:
+        storage_path = self.data_dir / "positions.jsonl"
+        if not storage_path.exists():
+            return 0.0
+        total = 0.0
+        today = as_of.date()
+        with storage_path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                if not record.get("is_closed") or not record.get("exit_timestamp"):
+                    continue
+                try:
+                    exit_ts = datetime.fromisoformat(record["exit_timestamp"])
+                except Exception:
+                    continue
+                if exit_ts.date() == today:
+                    total += float(record.get("realized_pnl_usd") or 0.0)
+        return total
+
+    def _cash_available_usd(self) -> float:
+        committed = sum(pos.size_usd for pos in self.pm.positions.values())
+        return max(0.0, self.config["total_capital_usd"] - committed)
+
+    def _maybe_send_summary(self, as_of: datetime):
+        interval = int(self.config["telegram"]["alert_summary_interval"])
+        if interval <= 0:
+            return
+        if as_of.hour % interval != 0:
+            return
+        bucket = as_of.strftime("%Y-%m-%d %H")
+        if bucket == self.last_summary_bucket:
+            return
+
+        self.last_summary_bucket = bucket
+        message = format_summary_alert(
+            open_positions=list(self.pm.positions.values()),
+            realized_today_usd=self._realized_today_usd(as_of),
+            cash_available_usd=self._cash_available_usd(),
+            as_of=as_of,
+        )
+        if len(message) > 4096:
+            message = message[:4090] + "..."
+
+        if self.dry_run:
+            log.info("[DRY-RUN] Telegram SUMMARY preview:\n%s", message)
+            return
+        send_telegram(message, self.config)
 
 
 # ============================================================
@@ -428,6 +498,9 @@ def main():
     CONFIG["api_keys"]["basescan"] = os.getenv("BASESCAN_API_KEY")  # 없으면 None, 홀더 조회 스킵
     CONFIG["telegram"]["bot_token"] = os.getenv("TELEGRAM_BOT_TOKEN")
     CONFIG["telegram"]["chat_id"] = os.getenv("TELEGRAM_CHAT_ID")
+    CONFIG["telegram"]["alert_entry"] = os.getenv("ALERT_ENTRY", "true").strip().lower() in {"1", "true", "yes", "on"}
+    CONFIG["telegram"]["alert_exit"] = os.getenv("ALERT_EXIT", "true").strip().lower() in {"1", "true", "yes", "on"}
+    CONFIG["telegram"]["alert_summary_interval"] = int(os.getenv("ALERT_SUMMARY_INTERVAL", "4"))
     CONFIG["total_capital_usd"] = args.capital
     CONFIG["chain_allocation"] = {
         "bsc": float(os.getenv("CHAIN_ALLOCATION_BSC", "0.55")),
