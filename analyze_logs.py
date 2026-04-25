@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import html
 import io
-import argparse
 import json
 import re
 import sys
@@ -12,6 +12,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from analysis.corrections import PROFILES
 from analysis.loader import (
     first_price_at_or_after,
     load_all_snapshots,
@@ -19,7 +20,7 @@ from analysis.loader import (
     parse_log_diagnostics,
     series_from_entry,
 )
-from analysis.metrics import compute_metrics
+from analysis.metrics import PortfolioMetrics, compute_metrics
 from analysis.sim_engine import params_for_chain, position_size_usd_for_chain, simulate_trade
 
 
@@ -66,7 +67,7 @@ def analyze_gaps(data_dir: Path, chain: str) -> dict:
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
             try:
-                timestamps.append(datetime.fromisoformat(__import__("json").loads(line)["timestamp"]))
+                timestamps.append(datetime.fromisoformat(json.loads(line)["timestamp"]))
             except Exception:
                 continue
     if len(timestamps) < 2:
@@ -104,12 +105,14 @@ def _fmt_usd(value: float | None) -> str:
     return f'<span class="{cls}">{sign}${value:.2f}</span>'
 
 
-def _candidate_rows(
+def build_candidate_rows(
     candidates: list[dict],
     snapshots: dict[str, dict[str, list[dict]]],
     *,
+    scenario: str,
     profit_lock_enabled: bool,
 ) -> list[dict]:
+    correction = PROFILES[scenario]
     rows: list[dict] = []
     for candidate in candidates:
         series = snapshots.get(candidate["chain"], {}).get(candidate["symbol"], [])
@@ -118,7 +121,7 @@ def _candidate_rows(
             continue
         entry_snapshot = dict(entry_snapshot)
         entry_snapshot["_position_size_usd"] = position_size_usd_for_chain(candidate["chain"])
-        params = params_for_chain(candidate["chain"])
+        params = params_for_chain(candidate["chain"], correction=correction)
         params.profit_lock_enabled = profit_lock_enabled
         trade = simulate_trade(entry_snapshot, series_from_entry(series, candidate["ts"]), params)
         rows.append(
@@ -133,7 +136,14 @@ def _candidate_rows(
     return rows
 
 
-def build_html_report(candidate_rows: list[dict], metrics, gap_stats: dict, cycles: list[datetime], errors: list[tuple[str, str]]) -> str:
+def build_html_report(
+    candidate_rows: list[dict],
+    metrics: PortfolioMetrics,
+    gap_stats: dict,
+    cycles: list[datetime],
+    errors: list[tuple[str, str]],
+    scenario: str,
+) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     uptime_pct = 0.0
     expected_cycles = 0
@@ -143,9 +153,9 @@ def build_html_report(candidate_rows: list[dict], metrics, gap_stats: dict, cycl
         uptime_pct = len(cycles) / max(1, expected_cycles) * 100.0
 
     cards = [
+        ("Scenario", scenario),
         ("Candidates", str(metrics.total_trades)),
         ("Closed Trades", str(metrics.closed_trades)),
-        ("Win Rate", f"{metrics.win_rate_pct:.1f}%"),
         ("Total PnL", f"${metrics.total_pnl_usd:+.2f}"),
     ]
 
@@ -154,19 +164,17 @@ def build_html_report(candidate_rows: list[dict], metrics, gap_stats: dict, cycl
         "<html lang='en'><head><meta charset='utf-8'>",
         f"<title>Jegubot Analysis Report - {html.escape(now)}</title>",
         f"<style>{CSS}</style></head><body>",
-        f"<h1>Jegubot Analysis Report</h1><p class='muted'>Generated {html.escape(now)}</p>",
+        f"<h1>Jegubot Analysis Report</h1><p class='muted'>Generated {html.escape(now)} | Scenario: {html.escape(scenario)}</p>",
         "<div class='grid'>",
     ]
     for label, value in cards:
         parts.append(f"<div class='card'><div class='label'>{html.escape(label)}</div><div class='value'>{html.escape(value)}</div></div>")
     parts.append("</div>")
-
     parts.append("<h2>Runtime Diagnostics</h2><table><tr><th>Metric</th><th>Value</th></tr>")
     parts.append(f"<tr><td>Observed cycles</td><td>{len(cycles)}</td></tr>")
     parts.append(f"<tr><td>Expected cycles</td><td>{expected_cycles}</td></tr>")
     parts.append(f"<tr><td>Estimated uptime</td><td>{uptime_pct:.1f}%</td></tr>")
     parts.append("</table>")
-
     parts.append("<h2>Snapshot Coverage</h2><table><tr><th>Chain</th><th>Records</th><th>Span (h)</th><th>Normal %</th><th>Abnormal gaps</th><th>Max gap (min)</th></tr>")
     for chain in ("bsc", "base", "solana"):
         stats = gap_stats.get(chain) or {}
@@ -175,14 +183,12 @@ def build_html_report(candidate_rows: list[dict], metrics, gap_stats: dict, cycl
             f"<td>{stats.get('normal_pct', 0)}%</td><td>{stats.get('abnormal_cnt', 0)}</td><td>{stats.get('max_gap_min', 0)}</td></tr>"
         )
     parts.append("</table>")
-
     parts.append("<h2>Top Errors</h2><table><tr><th>Count</th><th>Message</th></tr>")
     for message, count in summarize_errors(errors):
         parts.append(f"<tr><td>{count}</td><td>{html.escape(message)}</td></tr>")
     if not errors:
         parts.append("<tr><td colspan='2' class='muted'>No warnings or errors found.</td></tr>")
     parts.append("</table>")
-
     parts.append("<h2>Trade Outcomes</h2><table><tr><th>Chain</th><th>Symbol</th><th>Entry</th><th>Exit Reason</th><th>PnL %</th><th>PnL USD</th><th>Peak</th><th>Max DD</th><th>Hold h</th></tr>")
     for row in candidate_rows:
         trade = row["trade"]
@@ -196,34 +202,75 @@ def build_html_report(candidate_rows: list[dict], metrics, gap_stats: dict, cycl
     return "\n".join(parts)
 
 
+def run_scenario(scenario: str, profit_lock_enabled: bool) -> tuple[list[dict], PortfolioMetrics]:
+    snapshots = load_all_snapshots(DATA_DIR)
+    candidates = load_candidates_from_log(LOG_FILE)
+    rows = build_candidate_rows(
+        candidates,
+        snapshots,
+        scenario=scenario,
+        profit_lock_enabled=profit_lock_enabled,
+    )
+    return rows, compute_metrics([row["trade"] for row in rows])
+
+
+def print_comparison_table(results: dict[str, PortfolioMetrics]) -> None:
+    print("Scenario      | Trades | Closed | Win%  | Total PnL  | Avg/Trade | PF")
+    for scenario in ("ideal", "realistic", "conservative", "pessimistic"):
+        metrics = results[scenario]
+        print(
+            f"{scenario:<13}| {metrics.total_trades:<6}| {metrics.closed_trades:<7}| "
+            f"{metrics.win_rate_pct:>5.1f}%| {metrics.total_pnl_usd:+10.2f} | "
+            f"{metrics.avg_pnl_usd:>9.2f} | {metrics.profit_factor:>4.2f}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-profit-lock", action="store_true", help="Use original immediate take-profit behavior.")
+    parser.add_argument(
+        "--scenario",
+        default="ideal",
+        choices=["ideal", "realistic", "conservative", "pessimistic", "all"],
+        help="Correction scenario to run.",
+    )
     args = parser.parse_args()
+    profit_lock_enabled = not args.no_profit_lock
 
     print("=== Jegubot unified analysis ===")
+
+    if args.scenario == "all":
+        results = {}
+        for scenario in ("ideal", "realistic", "conservative", "pessimistic"):
+            _, metrics = run_scenario(scenario, profit_lock_enabled)
+            results[scenario] = metrics
+        print_comparison_table(results)
+        return
 
     snapshots = load_all_snapshots(DATA_DIR)
     candidates = load_candidates_from_log(LOG_FILE)
     cycles, errors = parse_log_diagnostics(LOG_FILE)
-
-    candidate_rows = _candidate_rows(
+    candidate_rows = build_candidate_rows(
         candidates,
         snapshots,
-        profit_lock_enabled=not args.no_profit_lock,
+        scenario=args.scenario,
+        profit_lock_enabled=profit_lock_enabled,
     )
     trades = [row["trade"] for row in candidate_rows]
     metrics = compute_metrics(trades)
-
     gap_stats = {chain: analyze_gaps(DATA_DIR, chain) for chain in ("bsc", "base", "solana")}
-    REPORT_FILE.write_text(build_html_report(candidate_rows, metrics, gap_stats, cycles, errors), encoding="utf-8")
+    REPORT_FILE.write_text(
+        build_html_report(candidate_rows, metrics, gap_stats, cycles, errors, args.scenario),
+        encoding="utf-8",
+    )
 
+    print(f"Scenario: {args.scenario}")
     print(f"Candidates: {metrics.total_trades}")
     print(f"Closed trades: {metrics.closed_trades}")
     print(f"Wins: {metrics.wins}")
     print(f"Total PnL: ${metrics.total_pnl_usd:+.2f}")
     print(f"Average PnL per closed trade: ${metrics.avg_pnl_usd:+.2f}")
-    print(f"Profit lock enabled: {not args.no_profit_lock}")
+    print(f"Profit lock enabled: {profit_lock_enabled}")
     print(f"Exit reasons: {metrics.by_exit_reason}")
     print(f"HTML report: {REPORT_FILE}")
 
