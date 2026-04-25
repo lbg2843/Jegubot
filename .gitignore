@@ -9,6 +9,8 @@ __pycache__/
 data/*.jsonl
 data/*.db
 data/snapshots/
+data/telegram_trade_state.json
+data/trading_safety_state.json
 logs/
 *.log
 
