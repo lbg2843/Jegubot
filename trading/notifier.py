@@ -44,8 +44,14 @@ class TelegramTradeNotifier:
         self.auto_approve_on_timeout = auto_approve_on_timeout
         self.poll_interval = poll_interval
         self._handlers: dict[str, Callable[[], Any]] = {}
-        self._state = {"offset": 0, "approvals": {}}
+        self._state = {
+            "offset": 0,
+            "approvals": {},
+            "handled_callback_ids": [],
+            "handled_update_ids": [],
+        }
         self.network_available = True
+        self.last_send_ok = True
         self._load_state()
 
     def configure_handlers(
@@ -66,6 +72,10 @@ class TelegramTradeNotifier:
             return
         try:
             self._state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self._state.setdefault("offset", 0)
+            self._state.setdefault("approvals", {})
+            self._state.setdefault("handled_callback_ids", [])
+            self._state.setdefault("handled_update_ids", [])
         except Exception:
             pass
 
@@ -79,23 +89,39 @@ class TelegramTradeNotifier:
     def _enabled(self) -> bool:
         return bool(self.bot_token and self.chat_id)
 
+    def _remember_limited(self, key: str, value: int | str, limit: int = 200):
+        bucket = self._state.setdefault(key, [])
+        if value in bucket:
+            return
+        bucket.append(value)
+        if len(bucket) > limit:
+            del bucket[:-limit]
+
+    def _was_handled(self, key: str, value: int | str) -> bool:
+        return value in self._state.get(key, [])
+
     def _api(self, method: str, payload: dict | None = None) -> dict:
         if not self._enabled():
             return {}
         payload = payload or {}
         url = f"https://api.telegram.org/bot{self.bot_token}/{method}"
-        try:
-            response = requests.post(url, json=payload, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            if not data.get("ok"):
-                raise RuntimeError(data)
-            self.network_available = True
-            return data
-        except Exception as exc:
-            self.network_available = False
-            log.warning("telegram api %s failed: %s", method, exc)
-            return {}
+        last_exc = None
+        for attempt in range(3):
+            try:
+                response = requests.post(url, json=payload, timeout=8)
+                response.raise_for_status()
+                data = response.json()
+                if not data.get("ok"):
+                    raise RuntimeError(data)
+                self.network_available = True
+                return data
+            except Exception as exc:
+                last_exc = exc
+                self.network_available = False
+                if attempt < 2:
+                    time.sleep(1.0 + attempt)
+        log.warning("telegram api %s failed: %s", method, last_exc)
+        return {}
 
     def _send_message(self, text: str, reply_markup: dict | None = None):
         if not self._enabled():
@@ -108,7 +134,9 @@ class TelegramTradeNotifier:
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        return self._api("sendMessage", payload)
+        response = self._api("sendMessage", payload)
+        self.last_send_ok = bool(response)
+        return response
 
     def _answer_callback(self, callback_query_id: str, text: str):
         if not self._enabled():
@@ -175,7 +203,7 @@ class TelegramTradeNotifier:
     def _consume_updates(self) -> list[dict]:
         if not self._enabled():
             return []
-        payload = {"timeout": 0, "offset": int(self._state.get("offset", 0))}
+        payload = {"timeout": 10, "offset": int(self._state.get("offset", 0))}
         data = self._api("getUpdates", payload)
         updates = data.get("result", [])
         for update in updates:
@@ -189,16 +217,28 @@ class TelegramTradeNotifier:
             self._handle_update(update)
 
     def _handle_update(self, update: dict):
+        update_id = update.get("update_id")
+        if update_id is not None:
+            if self._was_handled("handled_update_ids", update_id):
+                return
+            self._remember_limited("handled_update_ids", update_id)
+
         callback = update.get("callback_query")
         if callback:
+            callback_id = callback.get("id")
+            if callback_id and self._was_handled("handled_callback_ids", callback_id):
+                return
             data = callback.get("data", "")
             parts = data.split(":")
             if len(parts) == 3 and parts[0] == "trade":
                 decision = "approved" if parts[1] == "buy" else "rejected"
                 signal_id = parts[2]
                 approval = self._state["approvals"].setdefault(signal_id, {})
-                approval["decision"] = decision
+                if not approval.get("decision"):
+                    approval["decision"] = decision
                 self._save_state()
+                if callback_id:
+                    self._remember_limited("handled_callback_ids", callback_id)
                 self._answer_callback(callback["id"], f"{decision.upper()} recorded")
             return
 
@@ -220,18 +260,24 @@ class TelegramTradeNotifier:
                 self._save_state()
             return decision
 
+        if not self.last_send_ok:
+            if signal_id in self._state["approvals"]:
+                self._state["approvals"][signal_id]["decision"] = "send_failed"
+                self._save_state()
+            return "send_failed"
+
         started = time.time()
         while time.time() - started < timeout:
             for update in self._consume_updates():
                 self._handle_update(update)
+            decision = self._state["approvals"].get(signal_id, {}).get("decision")
+            if decision:
+                return decision
             if not self.network_available:
                 decision = "approved" if self.auto_approve_on_timeout else "timeout"
                 if signal_id in self._state["approvals"]:
                     self._state["approvals"][signal_id]["decision"] = decision
                     self._save_state()
-                return decision
-            decision = self._state["approvals"].get(signal_id, {}).get("decision")
-            if decision:
                 return decision
             time.sleep(self.poll_interval)
 

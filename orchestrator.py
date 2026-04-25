@@ -73,6 +73,8 @@ CONFIG = {
     "telegram": {
         "bot_token": None,  # os.getenv("TELEGRAM_BOT_TOKEN")
         "chat_id": None,    # os.getenv("TELEGRAM_CHAT_ID")
+        "trading_bot_token": None,  # os.getenv("TELEGRAM_TRADING_BOT_TOKEN")
+        "trading_chat_id": None,    # os.getenv("TELEGRAM_TRADING_CHAT_ID")
         "alert_entry": True,
         "alert_exit": True,
         "alert_summary_interval": 4,
@@ -87,6 +89,7 @@ CONFIG = {
         "mock_entry_signal": False,
         "mock_entry_chain": "bsc",
         "approval_timeout_sec": 300,
+        "max_signals_per_cycle": 1,
     },
     "data_dir": str(_BASE_DIR / "data"),
     "scraper_schedule": {
@@ -263,13 +266,18 @@ class Orchestrator:
             max_daily_trades=trading_cfg["max_daily_trades"],
         )
         notifier = TelegramTradeNotifier(
-            bot_token=self.config["telegram"]["bot_token"],
-            chat_id=self.config["telegram"]["chat_id"],
+            bot_token=self.config["telegram"]["trading_bot_token"],
+            chat_id=self.config["telegram"]["trading_chat_id"],
             state_path=self.data_dir / "telegram_trade_state.json",
             auto_approve_on_timeout=trading_cfg["auto_approve_on_timeout"],
         )
         self.trade_notifier = notifier
         self.executor = TradeExecutor(self.pm, notifier, safety, mode="dry_run")
+        if not notifier._enabled():
+            log.warning(
+                "trading notifier is disabled; set TELEGRAM_TRADING_BOT_TOKEN and "
+                "TELEGRAM_TRADING_CHAT_ID for real button approval"
+            )
         notifier.configure_handlers(
             status_handler=safety.get_status,
             stop_handler=self._manual_stop,
@@ -465,6 +473,9 @@ class Orchestrator:
                     if str(snap.get("contract_address", "")).startswith("mock-")
                 ]
                 candidates = mock_candidates + candidates
+            max_signals_per_cycle = int(self.config["trading"]["max_signals_per_cycle"])
+            if self.executor and max_signals_per_cycle > 0:
+                candidates = candidates[:max_signals_per_cycle]
             for cand in candidates:
                 ok, reason = passes_safety_gate(cand, chain)
                 if not ok:
@@ -614,6 +625,8 @@ def main():
     CONFIG["api_keys"]["basescan"] = os.getenv("BASESCAN_API_KEY")  # 없으면 None, 홀더 조회 스킵
     CONFIG["telegram"]["bot_token"] = os.getenv("TELEGRAM_BOT_TOKEN")
     CONFIG["telegram"]["chat_id"] = os.getenv("TELEGRAM_CHAT_ID")
+    CONFIG["telegram"]["trading_bot_token"] = os.getenv("TELEGRAM_TRADING_BOT_TOKEN")
+    CONFIG["telegram"]["trading_chat_id"] = os.getenv("TELEGRAM_TRADING_CHAT_ID")
     CONFIG["telegram"]["alert_entry"] = os.getenv("ALERT_ENTRY", "true").strip().lower() in {"1", "true", "yes", "on"}
     CONFIG["telegram"]["alert_exit"] = os.getenv("ALERT_EXIT", "true").strip().lower() in {"1", "true", "yes", "on"}
     CONFIG["telegram"]["alert_summary_interval"] = int(os.getenv("ALERT_SUMMARY_INTERVAL", "4"))
@@ -626,6 +639,7 @@ def main():
     CONFIG["trading"]["mock_entry_signal"] = os.getenv("MOCK_ENTRY_SIGNAL", "false").strip().lower() in {"1", "true", "yes", "on"}
     CONFIG["trading"]["mock_entry_chain"] = os.getenv("MOCK_ENTRY_CHAIN", "bsc").strip().lower()
     CONFIG["trading"]["approval_timeout_sec"] = int(os.getenv("APPROVAL_TIMEOUT_SEC", "300"))
+    CONFIG["trading"]["max_signals_per_cycle"] = int(os.getenv("MAX_SIGNALS_PER_CYCLE", "1"))
     CONFIG["total_capital_usd"] = args.capital
     CONFIG["chain_allocation"] = {
         "bsc": float(os.getenv("CHAIN_ALLOCATION_BSC", "0.55")),

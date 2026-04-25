@@ -1,12 +1,26 @@
 import requests
 import os
 from datetime import datetime
-from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    load_dotenv = None
 
-token = os.getenv("TELEGRAM_BOT_TOKEN")
-chat_id = os.getenv("TELEGRAM_CHAT_ID")
+if load_dotenv is not None:
+    load_dotenv()
+else:
+    env_path = Path(__file__).with_name(".env")
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line or line.lstrip().startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
+
+token = os.getenv("TELEGRAM_TRADING_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+chat_id = os.getenv("TELEGRAM_TRADING_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
 
 print(f"BOT_TOKEN : {token[:20]}..." if token else "BOT_TOKEN : 없음")
 print(f"CHAT_ID   : {chat_id}")

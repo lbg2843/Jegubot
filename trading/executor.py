@@ -29,6 +29,9 @@ class TradeExecutor:
 
         signal_id = self.notifier.send_entry_signal(signal)
         decision = self.notifier.wait_for_approval(signal_id, timeout=int(signal.get("approval_timeout", 300)))
+        if decision == "send_failed":
+            log.warning("approval message failed to send for signal %s", signal_id)
+            return {"status": "failed", "reason": "send_failed"}
         if decision not in {"approved", "auto_approved"}:
             log.info("user rejected signal %s (%s)", signal_id, decision)
             return {"status": "rejected", "reason": decision}
