@@ -34,12 +34,14 @@ from solana_scraper import scrape_solana_trending
 from mc_position_manager import (
     MultichainPositionManager,
     CHAIN_CONFIGS,
+    DISABLED_CHAIN_CONFIGS,
     PortfolioConfig,
     ExitReason,
 )
 
 
 _BASE_DIR = Path(__file__).parent
+ACTIVE_ENTRY_CHAINS = ("bsc", "solana")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,7 +61,7 @@ log = logging.getLogger("orchestrator")
 
 CONFIG = {
     "total_capital_usd": 10_000,
-    "chain_allocation": {"bsc": 0.25, "solana": 0.20, "base": 0.55},
+    "chain_allocation": {"bsc": 0.55, "solana": 0.45, "base": 0.00},
     "api_keys": {
         "bscscan": None,   # os.getenv("BSCSCAN_API_KEY")
         "basescan": None,  # os.getenv("BASESCAN_API_KEY") — 없으면 홀더 조회 스킵
@@ -208,8 +210,16 @@ class Orchestrator:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
         pf_cfg = PortfolioConfig(chain_allocation=config["chain_allocation"])
+        runtime_chain_configs = dict(CHAIN_CONFIGS)
+        runtime_chain_configs.update(
+            {
+                chain: cfg
+                for chain, cfg in DISABLED_CHAIN_CONFIGS.items()
+                if chain in self._legacy_position_chains()
+            }
+        )
         self.pm = MultichainPositionManager(
-            CHAIN_CONFIGS, pf_cfg,
+            runtime_chain_configs, pf_cfg,
             storage_path=str(self.data_dir / "positions.jsonl")
         )
 
@@ -220,6 +230,29 @@ class Orchestrator:
     # --------------------------------------------------------
     # 체인별 스크래핑
     # --------------------------------------------------------
+
+    def _legacy_position_chains(self) -> set[str]:
+        storage_path = self.data_dir / "positions.jsonl"
+        if not storage_path.exists():
+            return set()
+
+        chains: set[str] = set()
+        with storage_path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                if not record.get("is_closed") and record.get("chain"):
+                    chains.add(record["chain"])
+        return chains
+
+    def _chains_for_cycle(self) -> list[str]:
+        chains = list(ACTIVE_ENTRY_CHAINS)
+        for chain in sorted({pos.chain for pos in self.pm.positions.values()}):
+            if chain not in chains:
+                chains.append(chain)
+        return chains
 
     def scrape_chain(self, chain: str) -> list[dict]:
         """체인별 스크래퍼 호출. 실패 시 마지막 저장본 로드."""
@@ -288,7 +321,9 @@ class Orchestrator:
         snapshots_by_chain = {}
 
         # 1. 스크래핑 (체인별)
-        for chain in ["bsc", "base", "solana"]:
+        # Base disabled for new entries on 2026-04-25. Keep scraping any
+        # legacy position chains so existing positions can exit naturally.
+        for chain in self._chains_for_cycle():
             try:
                 snapshots_by_chain[chain] = self.scrape_chain(chain)
             except Exception as e:
@@ -306,6 +341,8 @@ class Orchestrator:
 
         # 3. 신규 진입 후보 탐지
         for chain, snapshots in snapshots_by_chain.items():
+            if chain not in ACTIVE_ENTRY_CHAINS:
+                continue
             if not snapshots:
                 continue
             candidates = detect_entry_signals(snapshots, chain)
@@ -363,8 +400,21 @@ class Orchestrator:
 def main():
     import argparse, os, sys
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    from dotenv import load_dotenv
-    load_dotenv(_BASE_DIR / ".env")
+    try:
+        from dotenv import load_dotenv
+    except ModuleNotFoundError:
+        load_dotenv = None
+
+    if load_dotenv is not None:
+        load_dotenv(_BASE_DIR / ".env")
+    else:
+        env_path = _BASE_DIR / ".env"
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line or line.lstrip().startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip())
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="1회만 실행")
     ap.add_argument("--interval", type=int, default=600, help="루프 주기 초 (기본 10분)")
@@ -379,6 +429,14 @@ def main():
     CONFIG["telegram"]["bot_token"] = os.getenv("TELEGRAM_BOT_TOKEN")
     CONFIG["telegram"]["chat_id"] = os.getenv("TELEGRAM_CHAT_ID")
     CONFIG["total_capital_usd"] = args.capital
+    CONFIG["chain_allocation"] = {
+        "bsc": float(os.getenv("CHAIN_ALLOCATION_BSC", "0.55")),
+        "solana": float(os.getenv("CHAIN_ALLOCATION_SOLANA", "0.45")),
+        "base": float(os.getenv("CHAIN_ALLOCATION_BASE", "0.00")),
+    }
+    CONFIG["scraper_schedule"]["bsc"] = int(os.getenv("SCRAPE_INTERVAL_BSC", str(CONFIG["scraper_schedule"]["bsc"])))
+    CONFIG["scraper_schedule"]["solana"] = int(os.getenv("SCRAPE_INTERVAL_SOLANA", str(CONFIG["scraper_schedule"]["solana"])))
+    CONFIG["scraper_schedule"]["base"] = int(os.getenv("SCRAPE_INTERVAL_BASE", str(CONFIG["scraper_schedule"]["base"])))
 
     # --verbose: DEBUG 레벨 활성화 (탈락 이유 등 상세 로그)
     if args.verbose:

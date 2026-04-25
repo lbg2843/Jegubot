@@ -71,6 +71,24 @@ CHAIN_CONFIGS = {
         liquidity_crash_pct=-25.0,
         b_holders_crash_pct=-15.0,
     ),
+    # "base": ChainConfig(
+    #     chain="base",
+    #     stop_loss_pct=-15.0,
+    #     trailing_activation_pct=8.0,
+    #     trailing_stop_pct=12.0,
+    #     take_profit_pct=60.0,
+    #     max_hold_hours=96,
+    #     capital_per_position_pct=6.0,
+    #     max_concurrent_positions=2,
+    #     liquidity_crash_pct=-18.0,
+    #     b_holders_crash_pct=-10.0,
+    # ),
+}
+
+# Disabled 2026-04-25 due to consistent losses (-$89 over 8 trades).
+# Kept separately so historical analysis and legacy open positions can
+# still resolve Base parameters without allowing new Base allocations.
+DISABLED_CHAIN_CONFIGS = {
     "base": ChainConfig(
         chain="base",
         stop_loss_pct=-15.0,

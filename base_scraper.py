@@ -21,6 +21,11 @@ from typing import Optional
 
 from gecko_client import TrendingToken, fetch_trending_pools
 
+# Base chain scraper is disabled as of 2026-04-25 for new entries.
+# Reason: -$89 PnL over 8 trades, and the chain's lower-volatility
+# profile did not fit the reflexivity strategy. The file remains as a
+# reference implementation and for any legacy Base monitoring needs.
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("base_scraper")
