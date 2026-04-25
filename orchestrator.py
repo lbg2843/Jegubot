@@ -39,6 +39,9 @@ from mc_position_manager import (
     ExitReason,
 )
 from notifier import format_entry_alert, format_exit_alert, format_summary_alert
+from trading.executor import TradeExecutor
+from trading.notifier import TelegramTradeNotifier
+from trading.safety import SafetyCircuitBreaker
 
 
 _BASE_DIR = Path(__file__).parent
@@ -73,6 +76,17 @@ CONFIG = {
         "alert_entry": True,
         "alert_exit": True,
         "alert_summary_interval": 4,
+    },
+    "trading": {
+        "mode": "disabled",
+        "auto_approve_on_timeout": True,
+        "daily_loss_limit_usd": 50.0,
+        "max_consecutive_losses": 5,
+        "max_position_size_usd": 100.0,
+        "max_daily_trades": 30,
+        "mock_entry_signal": False,
+        "mock_entry_chain": "bsc",
+        "approval_timeout_sec": 300,
     },
     "data_dir": str(_BASE_DIR / "data"),
     "scraper_schedule": {
@@ -207,9 +221,12 @@ def detect_entry_signals(snapshots: list, chain: str) -> list[dict]:
 # ============================================================
 
 class Orchestrator:
-    def __init__(self, config: dict, dry_run: bool = False):
+    def __init__(self, config: dict, dry_run: bool = False, trading_mode: str = "disabled"):
         self.config = config
         self.dry_run = dry_run
+        self.trading_mode = trading_mode
+        self.executor: Optional[TradeExecutor] = None
+        self.trade_notifier: Optional[TelegramTradeNotifier] = None
         self.data_dir = Path(config["data_dir"])
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -229,8 +246,47 @@ class Orchestrator:
 
         self.last_scrape: dict[str, float] = {"bsc": 0, "solana": 0, "base": 0}
         self.last_summary_bucket: str | None = None
+        self.mock_signal_used = False
         if self.dry_run:
             log.info("[DRY-RUN] 포지션 진입/청산 알림 비활성화")
+
+        if self.trading_mode == "dry_run":
+            self._init_trade_executor()
+
+    def _init_trade_executor(self):
+        trading_cfg = self.config["trading"]
+        safety = SafetyCircuitBreaker(
+            self.data_dir / "trading_safety_state.json",
+            daily_loss_limit_usd=trading_cfg["daily_loss_limit_usd"],
+            max_consecutive_losses=trading_cfg["max_consecutive_losses"],
+            max_position_size_usd=trading_cfg["max_position_size_usd"],
+            max_daily_trades=trading_cfg["max_daily_trades"],
+        )
+        notifier = TelegramTradeNotifier(
+            bot_token=self.config["telegram"]["bot_token"],
+            chat_id=self.config["telegram"]["chat_id"],
+            state_path=self.data_dir / "telegram_trade_state.json",
+            auto_approve_on_timeout=trading_cfg["auto_approve_on_timeout"],
+        )
+        self.trade_notifier = notifier
+        self.executor = TradeExecutor(self.pm, notifier, safety, mode="dry_run")
+        notifier.configure_handlers(
+            status_handler=safety.get_status,
+            stop_handler=self._manual_stop,
+            unhalt_handler=self._manual_unhalt,
+        )
+
+    def _manual_stop(self) -> str:
+        if not self.executor:
+            return "trade executor is not active"
+        self.executor.safety.halt_for_24h("manual_stop")
+        return self.executor.emergency_close_all()
+
+    def _manual_unhalt(self) -> str:
+        if not self.executor:
+            return "trade executor is not active"
+        self.executor.safety.manual_unhalt()
+        return "manual halt cleared"
 
     # --------------------------------------------------------
     # 체인별 스크래핑
@@ -258,6 +314,48 @@ class Orchestrator:
             if chain not in chains:
                 chains.append(chain)
         return chains
+
+    def _mock_signal_for_chain(self, chain: str) -> dict:
+        return {
+            "symbol": f"MOCK_{chain.upper()}",
+            "contract_address": f"mock-{chain}-contract",
+            "pool_address": f"mock-{chain}-pool",
+            "price_usd": 0.001234,
+            "price_change_1h_pct": 12.5,
+            "liquidity_usd": 450_000.0,
+            "volume_1h_usd": 85_000.0,
+            "txns_1h": 42,
+            "holders_binance": 0,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    def _inject_mock_signal(self, snapshots_by_chain: dict[str, list[dict]]):
+        trading_cfg = self.config["trading"]
+        if not trading_cfg["mock_entry_signal"] or self.mock_signal_used:
+            return
+        chain = trading_cfg["mock_entry_chain"]
+        snapshots_by_chain.setdefault(chain, [])
+        snapshots_by_chain[chain] = list(snapshots_by_chain[chain]) + [self._mock_signal_for_chain(chain)]
+        self.mock_signal_used = True
+        log.info("[MOCK] injected entry signal for [%s]", chain.upper())
+
+    def _build_trade_signal(self, snapshot: dict, chain: str) -> dict:
+        cfg = self.pm.chain_configs[chain]
+        capped_size_usd = min(
+            self._recommended_position_size_usd(chain),
+            float(self.config["trading"]["max_position_size_usd"]),
+        )
+        return {
+            **snapshot,
+            "chain": chain,
+            "position_size_usd": capped_size_usd,
+            "stop_loss_pct": cfg.stop_loss_pct,
+            "take_profit_pct": cfg.take_profit_pct,
+            "max_hold_hours": cfg.max_hold_hours,
+            "profit_lock": True,
+            "approval_timeout": self.config["trading"]["approval_timeout_sec"],
+            "total_capital_usd": self.config["total_capital_usd"],
+        }
 
     def scrape_chain(self, chain: str) -> list[dict]:
         """체인별 스크래퍼 호출. 실패 시 마지막 저장본 로드."""
@@ -324,6 +422,9 @@ class Orchestrator:
         log.info("사이클 시작")
         log.info("=" * 60)
 
+        if self.trade_notifier:
+            self.trade_notifier.process_pending_commands()
+
         snapshots_by_chain = {}
 
         # 1. 스크래핑 (체인별)
@@ -337,9 +438,14 @@ class Orchestrator:
                 snapshots_by_chain[chain] = []
 
         # 2. 기존 포지션 업데이트 + 청산
+        self._inject_mock_signal(snapshots_by_chain)
         exits = self.pm.update_all(snapshots_by_chain)
         for pos, reason, msg in exits:
             current_price = pos.current_price
+            if self.executor:
+                result = self.executor.handle_exit_signal(pos, reason)
+                log.info("executor exit result: %s", result.get("status"))
+                continue
             if not self.dry_run:
                 closed_pos = self.pm.close_position(pos, reason, msg)
                 self._notify_exit(closed_pos, reason, current_price, cycle_started_at)
@@ -353,10 +459,20 @@ class Orchestrator:
             if not snapshots:
                 continue
             candidates = detect_entry_signals(snapshots, chain)
+            if self.config["trading"]["mock_entry_signal"] and chain == self.config["trading"]["mock_entry_chain"]:
+                mock_candidates = [
+                    snap for snap in snapshots
+                    if str(snap.get("contract_address", "")).startswith("mock-")
+                ]
+                candidates = mock_candidates + candidates
             for cand in candidates:
                 ok, reason = passes_safety_gate(cand, chain)
                 if not ok:
                     log.debug(f"[{chain}] {cand['symbol']} 게이트 실패: {reason}")
+                    continue
+                if self.executor:
+                    result = self.executor.handle_entry_signal(self._build_trade_signal(cand, chain))
+                    log.info("executor entry result: %s", result.get("status"))
                     continue
                 if not self.dry_run:
                     pos = self.pm.open_position(
@@ -501,6 +617,15 @@ def main():
     CONFIG["telegram"]["alert_entry"] = os.getenv("ALERT_ENTRY", "true").strip().lower() in {"1", "true", "yes", "on"}
     CONFIG["telegram"]["alert_exit"] = os.getenv("ALERT_EXIT", "true").strip().lower() in {"1", "true", "yes", "on"}
     CONFIG["telegram"]["alert_summary_interval"] = int(os.getenv("ALERT_SUMMARY_INTERVAL", "4"))
+    CONFIG["trading"]["mode"] = os.getenv("TRADING_MODE", "").strip().lower() or "disabled"
+    CONFIG["trading"]["auto_approve_on_timeout"] = os.getenv("AUTO_APPROVE_ON_TIMEOUT", "true").strip().lower() in {"1", "true", "yes", "on"}
+    CONFIG["trading"]["daily_loss_limit_usd"] = float(os.getenv("DAILY_LOSS_LIMIT_USD", "50"))
+    CONFIG["trading"]["max_consecutive_losses"] = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "5"))
+    CONFIG["trading"]["max_position_size_usd"] = float(os.getenv("MAX_POSITION_SIZE_USD", "100"))
+    CONFIG["trading"]["max_daily_trades"] = int(os.getenv("MAX_DAILY_TRADES", "30"))
+    CONFIG["trading"]["mock_entry_signal"] = os.getenv("MOCK_ENTRY_SIGNAL", "false").strip().lower() in {"1", "true", "yes", "on"}
+    CONFIG["trading"]["mock_entry_chain"] = os.getenv("MOCK_ENTRY_CHAIN", "bsc").strip().lower()
+    CONFIG["trading"]["approval_timeout_sec"] = int(os.getenv("APPROVAL_TIMEOUT_SEC", "300"))
     CONFIG["total_capital_usd"] = args.capital
     CONFIG["chain_allocation"] = {
         "bsc": float(os.getenv("CHAIN_ALLOCATION_BSC", "0.55")),
@@ -519,9 +644,14 @@ def main():
     # DRY_RUN: CLI --dry-run 플래그 OR .env DRY_RUN=true 둘 다 인정
     env_dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
     dry_run = args.dry_run or env_dry_run
+    trading_mode = CONFIG["trading"]["mode"]
+    if trading_mode == "dry_run":
+        log.info("execution mode: TRADING_MODE=dry_run (approval flow + simulated execution)")
+    else:
+        pass
     log.info(f"실행 모드: {'DRY-RUN (시그널만, 실제 매매 없음)' if dry_run else 'LIVE (실제 매매 가능)'}")
 
-    orch = Orchestrator(CONFIG, dry_run=dry_run)
+    orch = Orchestrator(CONFIG, dry_run=dry_run, trading_mode=CONFIG["trading"]["mode"])
 
     if args.once:
         orch.run_cycle()
