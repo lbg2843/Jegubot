@@ -82,10 +82,14 @@ CONFIG = {
     "trading": {
         "mode": "disabled",
         "auto_approve_on_timeout": True,
-        "daily_loss_limit_usd": 50.0,
-        "max_consecutive_losses": 5,
+        "daily_loss_limit_usd": 100.0,
+        "max_consecutive_losses": 8,
         "max_position_size_usd": 100.0,
         "max_daily_trades": 30,
+        "halt_duration_hours_first": 1,
+        "halt_duration_hours_second": 4,
+        "halt_duration_hours_third": 24,
+        "loss_window_hours": 1.0,
         "mock_entry_signal": False,
         "mock_entry_chain": "bsc",
         "approval_timeout_sec": 300,
@@ -275,10 +279,15 @@ class Orchestrator:
         trading_cfg = self.config["trading"]
         safety = SafetyCircuitBreaker(
             self.data_dir / "trading_safety_state.json",
+            mode=self.trading_mode,
             daily_loss_limit_usd=trading_cfg["daily_loss_limit_usd"],
             max_consecutive_losses=trading_cfg["max_consecutive_losses"],
             max_position_size_usd=trading_cfg["max_position_size_usd"],
             max_daily_trades=trading_cfg["max_daily_trades"],
+            halt_duration_hours_first=trading_cfg["halt_duration_hours_first"],
+            halt_duration_hours_second=trading_cfg["halt_duration_hours_second"],
+            halt_duration_hours_third=trading_cfg["halt_duration_hours_third"],
+            loss_window_hours=trading_cfg["loss_window_hours"],
         )
         notifier = TelegramTradeNotifier(
             bot_token=self.config["telegram"]["trading_bot_token"],
@@ -685,10 +694,14 @@ def main():
     CONFIG["telegram"]["alert_summary_interval"] = int(os.getenv("ALERT_SUMMARY_INTERVAL", "4"))
     CONFIG["trading"]["mode"] = os.getenv("TRADING_MODE", "").strip().lower() or "disabled"
     CONFIG["trading"]["auto_approve_on_timeout"] = os.getenv("AUTO_APPROVE_ON_TIMEOUT", "true").strip().lower() in {"1", "true", "yes", "on"}
-    CONFIG["trading"]["daily_loss_limit_usd"] = float(os.getenv("DAILY_LOSS_LIMIT_USD", "50"))
-    CONFIG["trading"]["max_consecutive_losses"] = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "5"))
+    CONFIG["trading"]["daily_loss_limit_usd"] = float(os.getenv("DAILY_LOSS_LIMIT_USD", "100"))
+    CONFIG["trading"]["max_consecutive_losses"] = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "8"))
     CONFIG["trading"]["max_position_size_usd"] = float(os.getenv("MAX_POSITION_SIZE_USD", "100"))
     CONFIG["trading"]["max_daily_trades"] = int(os.getenv("MAX_DAILY_TRADES", "30"))
+    CONFIG["trading"]["halt_duration_hours_first"] = int(os.getenv("HALT_DURATION_HOURS_FIRST", "1"))
+    CONFIG["trading"]["halt_duration_hours_second"] = int(os.getenv("HALT_DURATION_HOURS_SECOND", "4"))
+    CONFIG["trading"]["halt_duration_hours_third"] = int(os.getenv("HALT_DURATION_HOURS_THIRD", "24"))
+    CONFIG["trading"]["loss_window_hours"] = float(os.getenv("LOSS_WINDOW_HOURS", "1"))
     CONFIG["trading"]["mock_entry_signal"] = os.getenv("MOCK_ENTRY_SIGNAL", "false").strip().lower() in {"1", "true", "yes", "on"}
     CONFIG["trading"]["mock_entry_chain"] = os.getenv("MOCK_ENTRY_CHAIN", "bsc").strip().lower()
     CONFIG["trading"]["approval_timeout_sec"] = int(os.getenv("APPROVAL_TIMEOUT_SEC", "300"))

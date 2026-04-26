@@ -177,7 +177,7 @@ class TradeExecutor:
                 results.append({"status": "failed", "reason": "position_manager_rejected", "signal_id": signal_id, "signal_key": signal_key})
                 continue
 
-            self.safety.record_trade_executed()
+            self.safety.record_trade_executed(mode_at_execute=self.mode)
             self._finalize_pending(signal_key)
             results.append({"status": "executed", "position": position, "approval": decision, "signal_id": signal_id, "signal_key": signal_key})
 
@@ -245,7 +245,7 @@ class TradeExecutor:
 
         pnl_pct = position.unrealized_pnl_pct
         pnl_usd = position.size_usd * (pnl_pct / 100.0)
-        self.safety.record_trade_closed(pnl_usd)
+        self.safety.record_trade_closed(pnl_usd, mode_at_close=self.mode)
         closed = self.position_manager.close_position(position, reason, f"executor:{reason.value}")
         self.notifier.send_exit_notification(closed, reason.value, pnl_pct, pnl_usd)
         return {"status": "closed", "position": closed}
