@@ -153,6 +153,8 @@ class Position:
     entry_liquidity: float
     entry_b_holders: int
     size_usd: float
+    token_amount: float = 0.0
+    entry_tx_hash: Optional[str] = None
 
     # 현재
     current_price: float = 0.0
@@ -170,6 +172,7 @@ class Position:
     exit_price: Optional[float] = None
     realized_pnl_pct: Optional[float] = None
     realized_pnl_usd: Optional[float] = None
+    exit_tx_hash: Optional[str] = None
 
     @property
     def unrealized_pnl_pct(self) -> float:
@@ -396,6 +399,8 @@ class MultichainPositionManager:
             entry_liquidity=token_snapshot["liquidity_usd"],
             entry_b_holders=token_snapshot.get("holders_binance", 0),
             size_usd=size_usd,
+            token_amount=float(token_snapshot.get("_token_amount") or 0.0),
+            entry_tx_hash=token_snapshot.get("_entry_tx_hash"),
             current_price=token_snapshot["price_usd"],
             peak_price=token_snapshot["price_usd"],
             current_liquidity=token_snapshot["liquidity_usd"],
@@ -451,13 +456,29 @@ class MultichainPositionManager:
 
         return exits
 
-    def close_position(self, pos: Position, reason: ExitReason, msg: str):
+    def close_position(
+        self,
+        pos: Position,
+        reason: ExitReason,
+        msg: str,
+        *,
+        exit_price: Optional[float] = None,
+        realized_pnl_pct: Optional[float] = None,
+        realized_pnl_usd: Optional[float] = None,
+        exit_tx_hash: Optional[str] = None,
+    ):
         pos.is_closed = True
         pos.exit_reason = reason.value
         pos.exit_timestamp = iso_utc_now()
-        pos.exit_price = pos.current_price
-        pos.realized_pnl_pct = pos.unrealized_pnl_pct
-        pos.realized_pnl_usd = pos.size_usd * (pos.realized_pnl_pct / 100)
+        pos.exit_price = exit_price if exit_price is not None else pos.current_price
+        pos.current_price = pos.exit_price
+        pos.realized_pnl_pct = realized_pnl_pct if realized_pnl_pct is not None else pos.unrealized_pnl_pct
+        pos.realized_pnl_usd = (
+            realized_pnl_usd
+            if realized_pnl_usd is not None
+            else pos.size_usd * (pos.realized_pnl_pct / 100)
+        )
+        pos.exit_tx_hash = exit_tx_hash
 
         key = self._pos_key(pos.chain, pos.contract_address)
         del self.positions[key]

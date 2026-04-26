@@ -25,8 +25,8 @@ class TradeExecutor:
         self._bsc_wallet = None
         self._sol_wallet = None
         self._load_state()
-        if self.mode != "dry_run":
-            log.warning("live mode is not implemented yet; executor will refuse live trades")
+        if self.mode == "live":
+            log.info("live mode enabled for trade executor")
 
     def _load_state(self):
         if not self.state_path or not self.state_path.exists():
@@ -67,6 +67,10 @@ class TradeExecutor:
             return {"status": "duplicate_open", "signal_key": signal_key}
         if signal_key in self._state["pending_entries"]:
             return {"status": "already_pending", "signal_key": signal_key}
+        can_open, open_reason = self.position_manager.can_open(chain, signal.get("contract_address"))
+        if not can_open:
+            log.warning("trade blocked by position manager: %s", open_reason)
+            return {"status": "blocked", "reason": open_reason}
 
         allowed, reason = self.safety.can_execute(chain, amount_usd)
         if not allowed:
@@ -136,18 +140,18 @@ class TradeExecutor:
                 results.append({"status": "rejected", "reason": decision, "signal_id": signal_id, "signal_key": signal_key})
                 continue
 
-            if self.mode != "dry_run":
-                self._finalize_pending(signal_key)
-                results.append({"status": "rejected", "reason": "live_not_implemented", "signal_id": signal_id, "signal_key": signal_key})
-                continue
-
             if self._open_position_exists(signal):
                 self._finalize_pending(signal_key)
                 results.append({"status": "duplicate_open", "signal_id": signal_id, "signal_key": signal_key})
                 continue
+            chain = signal.get("chain", "?")
+            can_open, open_reason = self.position_manager.can_open(chain, signal.get("contract_address"))
+            if not can_open:
+                self._finalize_pending(signal_key)
+                results.append({"status": "blocked", "reason": open_reason, "signal_id": signal_id, "signal_key": signal_key})
+                continue
 
             amount_usd = float(signal.get("position_size_usd", 0.0))
-            chain = signal.get("chain", "?")
             allowed, reason = self.safety.can_execute(chain, amount_usd)
             if not allowed:
                 log.warning("trade blocked by safety at execution time: %s", reason)
@@ -155,7 +159,7 @@ class TradeExecutor:
                 results.append({"status": "blocked", "reason": reason, "signal_id": signal_id, "signal_key": signal_key})
                 continue
 
-            buy_result = self._simulate_buy(signal)
+            buy_result = self._execute_buy(signal)
             if not buy_result["ok"]:
                 self._finalize_pending(signal_key)
                 results.append({"status": "failed", "reason": buy_result["reason"], "signal_id": signal_id, "signal_key": signal_key})
@@ -167,10 +171,11 @@ class TradeExecutor:
                 results.append({"status": "failed", "reason": "invalid_chain_position_pct", "signal_id": signal_id, "signal_key": signal_key})
                 continue
 
+            signal_for_position = self._signal_with_execution_fill(signal, buy_result)
             effective_total_capital_usd = amount_usd / (cfg.capital_per_position_pct / 100.0)
             position = self.position_manager.open_position(
                 chain,
-                signal,
+                signal_for_position,
                 total_capital_usd=effective_total_capital_usd,
             )
             if position is None:
@@ -180,7 +185,16 @@ class TradeExecutor:
 
             self.safety.record_trade_executed(mode_at_execute=self.mode)
             self._finalize_pending(signal_key)
-            results.append({"status": "executed", "position": position, "approval": decision, "signal_id": signal_id, "signal_key": signal_key})
+            results.append(
+                {
+                    "status": "executed",
+                    "position": position,
+                    "approval": decision,
+                    "signal_id": signal_id,
+                    "signal_key": signal_key,
+                    "tx_hash": buy_result.get("tx_hash"),
+                }
+            )
 
         return results
 
@@ -237,19 +251,128 @@ class TradeExecutor:
         )
 
     def handle_exit_signal(self, position, reason):
-        if self.mode != "dry_run":
-            return {"status": "rejected", "reason": "live_not_implemented"}
-
-        sell_result = self._simulate_sell(position)
+        sell_result = self._execute_sell(position)
         if not sell_result["ok"]:
             return {"status": "failed", "reason": sell_result["reason"]}
 
-        pnl_pct = position.unrealized_pnl_pct
-        pnl_usd = position.size_usd * (pnl_pct / 100.0)
+        pnl_usd = float(sell_result.get("amount_out_usd", 0.0)) - float(position.size_usd)
+        pnl_pct = (pnl_usd / float(position.size_usd)) * 100.0 if position.size_usd else 0.0
         self.safety.record_trade_closed(pnl_usd, mode_at_close=self.mode)
-        closed = self.position_manager.close_position(position, reason, f"executor:{reason.value}")
+        closed = self.position_manager.close_position(
+            position,
+            reason,
+            f"executor:{reason.value}",
+            exit_price=sell_result.get("exit_price"),
+            realized_pnl_pct=pnl_pct,
+            realized_pnl_usd=pnl_usd,
+            exit_tx_hash=sell_result.get("tx_hash"),
+        )
         self.notifier.send_exit_notification(closed, reason.value, pnl_pct, pnl_usd)
-        return {"status": "closed", "position": closed}
+        return {"status": "closed", "position": closed, "tx_hash": sell_result.get("tx_hash")}
+
+    def _execute_buy(self, signal: dict) -> dict:
+        if self.mode == "live":
+            return self._buy_live(signal)
+        return self._simulate_buy(signal)
+
+    def _execute_sell(self, position) -> dict:
+        if self.mode == "live":
+            return self._sell_live(position)
+        return self._simulate_sell(position)
+
+    def _signal_with_execution_fill(self, signal: dict, buy_result: dict) -> dict:
+        filled = dict(signal)
+        amount_out = float(buy_result.get("amount_out_token") or 0.0)
+        amount_in = float(signal.get("position_size_usd", 0.0))
+        if amount_out > 0 and amount_in > 0:
+            filled["price_usd"] = amount_in / amount_out
+            filled["_token_amount"] = amount_out
+        filled["_entry_tx_hash"] = buy_result.get("tx_hash")
+        return filled
+
+    def _buy_live(self, signal: dict) -> dict:
+        chain = str(signal.get("chain", "")).lower()
+        token = signal.get("contract_address")
+        amount_usd = float(signal.get("position_size_usd", 0.0))
+        if not token:
+            return {"ok": False, "reason": "missing_contract_address"}
+        if amount_usd <= 0:
+            return {"ok": False, "reason": "invalid_position_size"}
+
+        try:
+            if chain == "bsc":
+                from .dex_pancakeswap import PancakeSwap
+
+                result = PancakeSwap(self._get_live_wallet(chain)).buy(token, amount_usd, slippage_pct=2.0)
+                if not result.success:
+                    return {"ok": False, "reason": result.error or "bsc_buy_failed", "tx_hash": result.tx_hash}
+                return {
+                    "ok": True,
+                    "tx_hash": result.tx_hash,
+                    "amount_out_token": float(result.amount_out or 0.0),
+                    "timestamp": iso_utc_now(),
+                }
+
+            if chain == "solana":
+                from .dex_jupiter import Jupiter
+
+                result = Jupiter(self._get_live_wallet(chain)).buy(token, amount_usd, slippage_pct=2.5)
+                if not result.success:
+                    return {"ok": False, "reason": result.error or "solana_buy_failed", "tx_hash": result.tx_signature}
+                return {
+                    "ok": True,
+                    "tx_hash": result.tx_signature,
+                    "amount_out_token": float(result.amount_out or 0.0),
+                    "timestamp": iso_utc_now(),
+                }
+        except Exception as exc:
+            return {"ok": False, "reason": str(exc)}
+
+        return {"ok": False, "reason": f"unsupported_chain:{chain}"}
+
+    def _sell_live(self, position) -> dict:
+        chain = str(position.chain).lower()
+        token = position.contract_address
+        amount_token = float(getattr(position, "token_amount", 0.0) or 0.0)
+        if not token:
+            return {"ok": False, "reason": "missing_contract_address"}
+        if amount_token <= 0:
+            return {"ok": False, "reason": "missing_token_amount_for_live_sell"}
+
+        try:
+            if chain == "bsc":
+                from .dex_pancakeswap import PancakeSwap
+
+                result = PancakeSwap(self._get_live_wallet(chain)).sell(token, amount_token, slippage_pct=2.0)
+                if not result.success:
+                    return {"ok": False, "reason": result.error or "bsc_sell_failed", "tx_hash": result.tx_hash}
+                exit_price = (float(result.amount_out or 0.0) / amount_token) if amount_token > 0 else None
+                return {
+                    "ok": True,
+                    "tx_hash": result.tx_hash,
+                    "amount_out_usd": float(result.amount_out or 0.0),
+                    "exit_price": exit_price,
+                    "timestamp": iso_utc_now(),
+                }
+
+            if chain == "solana":
+                from .dex_jupiter import Jupiter
+
+                result = Jupiter(self._get_live_wallet(chain)).sell(token, amount_token, slippage_pct=2.5)
+                if not result.success:
+                    return {"ok": False, "reason": result.error or "solana_sell_failed", "tx_hash": result.tx_signature}
+                exit_price = (float(result.amount_out or 0.0) / amount_token) if amount_token > 0 else None
+                return {
+                    "ok": True,
+                    "tx_hash": result.tx_signature,
+                    "amount_out_usd": float(result.amount_out or 0.0),
+                    "exit_price": exit_price,
+                    "timestamp": iso_utc_now(),
+                }
+        except Exception as exc:
+            return {"ok": False, "reason": str(exc)}
+
+        return {"ok": False, "reason": f"unsupported_chain:{chain}"}
 
     def _simulate_buy(self, signal: dict) -> dict:
         log.info(
