@@ -92,6 +92,7 @@ CONFIG = {
         "max_signals_per_cycle": 1,
     },
     "data_dir": str(_BASE_DIR / "data"),
+    "scraper_enrich_holders": False,
     "scraper_schedule": {
         "bsc": 3600,       # 1h
         "solana": 900,     # 15min (미구현, placeholder)
@@ -232,6 +233,7 @@ class Orchestrator:
         self.trade_notifier: Optional[TelegramTradeNotifier] = None
         self.data_dir = Path(config["data_dir"])
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.heartbeat_path = self.data_dir / "run_heartbeat.json"
 
         pf_cfg = PortfolioConfig(chain_allocation=config["chain_allocation"])
         runtime_chain_configs = dict(CHAIN_CONFIGS)
@@ -253,8 +255,21 @@ class Orchestrator:
         if self.dry_run:
             log.info("[DRY-RUN] 포지션 진입/청산 알림 비활성화")
 
-        if self.trading_mode == "dry_run":
+        if self.trading_mode in {"dry_run", "live"}:
             self._init_trade_executor()
+
+    def _write_heartbeat(self, stage: str, **extra):
+        payload = {
+            "timestamp": datetime.now().isoformat(),
+            "stage": stage,
+            "trading_mode": self.trading_mode,
+            "dry_run": self.dry_run,
+        }
+        payload.update(extra)
+        self.heartbeat_path.write_text(
+            json.dumps(payload, ensure_ascii=True, indent=2),
+            encoding="utf-8",
+        )
 
     def _init_trade_executor(self):
         trading_cfg = self.config["trading"]
@@ -272,7 +287,13 @@ class Orchestrator:
             auto_approve_on_timeout=trading_cfg["auto_approve_on_timeout"],
         )
         self.trade_notifier = notifier
-        self.executor = TradeExecutor(self.pm, notifier, safety, mode="dry_run")
+        self.executor = TradeExecutor(
+            self.pm,
+            notifier,
+            safety,
+            mode=self.trading_mode,
+            state_path=self.data_dir / "trade_executor_state.json",
+        )
         if not notifier._enabled():
             log.warning(
                 "trading notifier is disabled; set TELEGRAM_TRADING_BOT_TOKEN and "
@@ -378,9 +399,11 @@ class Orchestrator:
         tokens = []
 
         if chain == "bsc":
-            tokens = scrape_trending("bsc", self.config["api_keys"].get("bscscan"))
+            bscscan_key = self.config["api_keys"].get("bscscan") if self.config["scraper_enrich_holders"] else None
+            tokens = scrape_trending("bsc", bscscan_key)
         elif chain == "base":
-            tokens = scrape_base_trending(self.config["api_keys"].get("basescan"))
+            basescan_key = self.config["api_keys"].get("basescan") if self.config["scraper_enrich_holders"] else None
+            tokens = scrape_base_trending(basescan_key)
         elif chain == "solana":
             tokens = scrape_solana_trending()
 
@@ -392,7 +415,13 @@ class Orchestrator:
             store.save(tokens)
             log.info(f"[{chain}] {len(tokens)}개 스냅샷 저장")
 
-        return [self._token_to_dict(t) for t in tokens]
+        if tokens:
+            return [self._token_to_dict(t) for t in tokens]
+
+        cached = self.load_latest_snapshots(chain)
+        if cached:
+            log.warning(f"[{chain}] scraper returned no fresh data; using cached snapshots ({len(cached)} items)")
+        return cached
 
     def _token_to_dict(self, token) -> dict:
         """TrendingToken → dict"""
@@ -426,28 +455,49 @@ class Orchestrator:
 
     def run_cycle(self):
         cycle_started_at = datetime.now()
+        self._write_heartbeat("cycle_start")
         log.info("=" * 60)
         log.info("사이클 시작")
         log.info("=" * 60)
 
         if self.trade_notifier:
-            self.trade_notifier.process_pending_commands()
+            self._write_heartbeat("before_pending_commands")
+            self.trade_notifier.process_pending_commands(
+                long_poll_timeout=0,
+                request_timeout=1.5,
+                max_attempts=1,
+            )
+            self._write_heartbeat("after_pending_commands")
+        if self.executor:
+            self._write_heartbeat("before_pending_entries")
+            for result in self.executor.process_pending_entries():
+                log.info("executor pending result: %s", result.get("status"))
+            self._write_heartbeat("after_pending_entries")
 
         snapshots_by_chain = {}
+        self._write_heartbeat("before_scrape")
 
         # 1. 스크래핑 (체인별)
         # Base disabled for new entries on 2026-04-25. Keep scraping any
         # legacy position chains so existing positions can exit naturally.
         for chain in self._chains_for_cycle():
             try:
+                self._write_heartbeat("before_scrape_chain", chain=chain)
                 snapshots_by_chain[chain] = self.scrape_chain(chain)
+                self._write_heartbeat("after_scrape_chain", chain=chain, snapshot_count=len(snapshots_by_chain[chain]))
             except Exception as e:
                 log.error(f"[{chain}] 스크래핑 실패: {e}")
-                snapshots_by_chain[chain] = []
+                cached = self.load_latest_snapshots(chain)
+                if cached:
+                    log.warning(f"[{chain}] using cached snapshots after scrape failure ({len(cached)} items)")
+                snapshots_by_chain[chain] = cached
+                self._write_heartbeat("scrape_chain_failed", chain=chain, snapshot_count=len(cached), error=str(e))
 
         # 2. 기존 포지션 업데이트 + 청산
+        self._write_heartbeat("before_position_update")
         self._inject_mock_signal(snapshots_by_chain)
         exits = self.pm.update_all(snapshots_by_chain)
+        self._write_heartbeat("after_position_update", exit_count=len(exits))
         for pos, reason, msg in exits:
             current_price = pos.current_price
             if self.executor:
@@ -461,6 +511,7 @@ class Orchestrator:
                 log.info(f"[DRY-RUN] 청산 스킵: {pos.symbol} ({reason})")
 
         # 3. 신규 진입 후보 탐지
+        self._write_heartbeat("before_entry_scan")
         for chain, snapshots in snapshots_by_chain.items():
             if chain not in ACTIVE_ENTRY_CHAINS:
                 continue
@@ -482,7 +533,7 @@ class Orchestrator:
                     log.debug(f"[{chain}] {cand['symbol']} 게이트 실패: {reason}")
                     continue
                 if self.executor:
-                    result = self.executor.handle_entry_signal(self._build_trade_signal(cand, chain))
+                    result = self.executor.submit_entry_signal(self._build_trade_signal(cand, chain))
                     log.info("executor entry result: %s", result.get("status"))
                     continue
                 if not self.dry_run:
@@ -509,7 +560,9 @@ class Orchestrator:
                     log.info("[DRY-RUN] Telegram ENTRY preview:\n%s", preview)
 
         # 4. 리포트
+        self._write_heartbeat("before_summary")
         self._maybe_send_summary(cycle_started_at)
+        self._write_heartbeat("cycle_complete", open_positions=len(self.pm.positions))
         log.info("\n" + self.pm.summary())
         log.info("사이클 종료\n")
 
@@ -649,6 +702,7 @@ def main():
     CONFIG["scraper_schedule"]["bsc"] = int(os.getenv("SCRAPE_INTERVAL_BSC", str(CONFIG["scraper_schedule"]["bsc"])))
     CONFIG["scraper_schedule"]["solana"] = int(os.getenv("SCRAPE_INTERVAL_SOLANA", str(CONFIG["scraper_schedule"]["solana"])))
     CONFIG["scraper_schedule"]["base"] = int(os.getenv("SCRAPE_INTERVAL_BASE", str(CONFIG["scraper_schedule"]["base"])))
+    CONFIG["scraper_enrich_holders"] = os.getenv("ENRICH_HOLDERS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
     # --verbose: DEBUG 레벨 활성화 (탈락 이유 등 상세 로그)
     if args.verbose:
