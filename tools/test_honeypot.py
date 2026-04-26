@@ -44,18 +44,29 @@ def main():
     )
     elapsed = time.perf_counter() - started
 
-    print(json.dumps(
-        {
-            "is_safe": result.is_safe,
-            "reason": result.reason,
-            "layer": result.layer,
-            "round_trip_loss_pct": result.round_trip_loss_pct,
-            "details": result.details,
-            "elapsed_sec": round(elapsed, 3),
-        },
-        indent=2,
-        ensure_ascii=False,
-    ))
+    print(f"\n토큰: {args.token}")
+    print(f"체인: {args.chain}")
+    print(f"테스트 금액: ${args.amount}")
+    print("=" * 60)
+
+    if result.is_safe:
+        print(f"\nSAFE: {result.reason}")
+    else:
+        print(f"\nUNSAFE: {result.reason}")
+        print(f"  Layer: {result.layer}")
+
+    print("\n상세:")
+    print(f"  Buy quote OK: {result.buy_quote_ok}")
+    print(f"  Sell quote OK: {result.sell_quote_ok}")
+    if result.round_trip_loss_pct is not None:
+        print(f"  Round-trip loss: {result.round_trip_loss_pct:.2f}%")
+    if result.static_risk_score:
+        print(f"  Static risk score: {result.static_risk_score}/10")
+    print(f"  Checked in: {elapsed:.3f}s")
+
+    if result.details:
+        print("\n  Details:")
+        print(json.dumps(result.details, indent=4, ensure_ascii=False, default=str))
 
 
 if __name__ == "__main__":

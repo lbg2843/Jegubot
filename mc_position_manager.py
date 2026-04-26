@@ -22,6 +22,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from trading.time_utils import iso_utc_now, parse_iso_utc
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("mc_position_mgr")
@@ -192,8 +194,8 @@ class Position:
         if not self.entry_timestamp or not self.last_update:
             return 0.0
         try:
-            entry_dt = datetime.fromisoformat(self.entry_timestamp)
-            now_dt = datetime.fromisoformat(self.last_update)
+            entry_dt = parse_iso_utc(self.entry_timestamp)
+            now_dt = parse_iso_utc(self.last_update)
             return (now_dt - entry_dt).total_seconds() / 3600
         except Exception:
             return 0.0
@@ -383,7 +385,7 @@ class MultichainPositionManager:
             log.warning(f"MDD 경고 구간, 포지션 사이즈 축소 → {size_pct:.1f}%")
 
         size_usd = total_capital_usd * (size_pct / 100)
-        now = datetime.utcnow().isoformat()
+        now = iso_utc_now()
 
         pos = Position(
             chain=chain,
@@ -415,7 +417,7 @@ class MultichainPositionManager:
         snapshots_by_chain: {"bsc": [...], "base": [...], "solana": [...]}
         """
         exits = []
-        now = datetime.utcnow().isoformat()
+        now = iso_utc_now()
 
         # Halt mode 회복 체크
         if self.halt_mode:
@@ -452,7 +454,7 @@ class MultichainPositionManager:
     def close_position(self, pos: Position, reason: ExitReason, msg: str):
         pos.is_closed = True
         pos.exit_reason = reason.value
-        pos.exit_timestamp = datetime.utcnow().isoformat()
+        pos.exit_timestamp = iso_utc_now()
         pos.exit_price = pos.current_price
         pos.realized_pnl_pct = pos.unrealized_pnl_pct
         pos.realized_pnl_usd = pos.size_usd * (pos.realized_pnl_pct / 100)
@@ -556,7 +558,7 @@ def test_multichain():
         print(f"\n[t={h}h] {desc}")
         for pos in pm.positions.values():
             pos.last_update = (
-                datetime.fromisoformat(list(pm.positions.values())[0].entry_timestamp)
+                parse_iso_utc(list(pm.positions.values())[0].entry_timestamp)
                 + timedelta(hours=h)
             ).isoformat()
 

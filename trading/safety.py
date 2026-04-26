@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List
 
+from .time_utils import parse_iso_utc, utc_now
+
 
 @dataclass
 class SafetyState:
@@ -66,7 +68,7 @@ class SafetyCircuitBreaker:
         )
 
     def reset_daily_if_needed(self):
-        today = datetime.now().date().isoformat()
+        today = utc_now().date().isoformat()
         if self.state.last_reset_date == today:
             return
         self.state.daily_pnl_usd = 0.0
@@ -88,7 +90,7 @@ class SafetyCircuitBreaker:
     def _apply_halt(self, reason: str):
         self.state.halt_count_today = int(self.state.halt_count_today or 0) + 1
         duration_hours = self._halt_duration_hours_for_count(self.state.halt_count_today)
-        self.state.halt_until = (datetime.now() + timedelta(hours=duration_hours)).isoformat()
+        self.state.halt_until = (utc_now() + timedelta(hours=duration_hours)).isoformat()
         self.state.halt_reason = reason
         self._save()
 
@@ -113,13 +115,13 @@ class SafetyCircuitBreaker:
         items = []
         for value in self.state.recent_losses or []:
             try:
-                items.append(datetime.fromisoformat(value))
+                items.append(parse_iso_utc(value))
             except ValueError:
                 continue
         return items
 
     def _trim_recent_losses(self, now: datetime | None = None) -> list[datetime]:
-        now = now or datetime.now()
+        now = now or utc_now()
         cutoff = now - timedelta(hours=self.loss_window_hours)
         kept = [ts for ts in self._recent_loss_datetimes() if ts > cutoff]
         self.state.recent_losses = [ts.isoformat() for ts in kept]
@@ -133,10 +135,10 @@ class SafetyCircuitBreaker:
 
         if self.state.halt_until:
             try:
-                halt_until = datetime.fromisoformat(self.state.halt_until)
+                halt_until = parse_iso_utc(self.state.halt_until)
             except ValueError:
                 halt_until = None
-            if halt_until and halt_until > datetime.now():
+            if halt_until and halt_until > utc_now():
                 return False, f"halted_until:{halt_until.isoformat()}"
             self.manual_unhalt()
 
@@ -165,7 +167,7 @@ class SafetyCircuitBreaker:
 
         self.reset_daily_if_needed()
         self.state.daily_pnl_usd += float(pnl_usd)
-        now = datetime.now()
+        now = utc_now()
         recent_losses = self._trim_recent_losses(now)
 
         if pnl_usd < 0:

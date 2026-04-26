@@ -20,7 +20,7 @@ import time
 import logging
 import json
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import asdict
 from typing import Optional
 
@@ -42,6 +42,7 @@ from notifier import format_entry_alert, format_exit_alert, format_summary_alert
 from trading.executor import TradeExecutor
 from trading.notifier import TelegramTradeNotifier
 from trading.safety import SafetyCircuitBreaker
+from trading.time_utils import iso_utc_now, parse_iso_utc, utc_now
 
 
 _BASE_DIR = Path(__file__).parent
@@ -56,6 +57,7 @@ logging.basicConfig(
     ],
     force=True,  # 스크래퍼 모듈이 먼저 basicConfig 잡아도 덮어씀
 )
+logging.Formatter.converter = time.gmtime
 log = logging.getLogger("orchestrator")
 
 
@@ -264,7 +266,7 @@ class Orchestrator:
 
     def _write_heartbeat(self, stage: str, **extra):
         payload = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": iso_utc_now(),
             "stage": stage,
             "trading_mode": self.trading_mode,
             "dry_run": self.dry_run,
@@ -364,7 +366,7 @@ class Orchestrator:
             "volume_1h_usd": 85_000.0,
             "txns_1h": 42,
             "holders_binance": 0,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": iso_utc_now(),
         }
 
     def _inject_mock_signal(self, snapshots_by_chain: dict[str, list[dict]]):
@@ -463,7 +465,7 @@ class Orchestrator:
     # --------------------------------------------------------
 
     def run_cycle(self):
-        cycle_started_at = datetime.now()
+        cycle_started_at = utc_now()
         self._write_heartbeat("cycle_start")
         log.info("=" * 60)
         log.info("사이클 시작")
@@ -615,7 +617,7 @@ class Orchestrator:
                 if not record.get("is_closed") or not record.get("exit_timestamp"):
                     continue
                 try:
-                    exit_ts = datetime.fromisoformat(record["exit_timestamp"])
+                    exit_ts = parse_iso_utc(record["exit_timestamp"])
                 except Exception:
                     continue
                 if exit_ts.date() == today:
@@ -747,9 +749,7 @@ def main():
             except Exception as e:
                 log.error(f"사이클 에러: {e}", exc_info=True)
 
-            next_time = datetime.now().strftime("%H:%M:%S")
-            from datetime import timedelta
-            next_run = (datetime.now() + timedelta(seconds=args.interval)).strftime("%H:%M:%S")
+            next_run = (utc_now() + timedelta(seconds=args.interval)).strftime("%H:%M:%S UTC")
             log.info(f"대기 중... 다음 사이클: {next_run} ({args.interval}초 후) — Ctrl+C로 종료")
             time.sleep(args.interval)
 

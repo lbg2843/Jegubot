@@ -8,6 +8,8 @@ from typing import Any, Callable
 
 import requests
 
+from .time_utils import format_for_user
+
 
 log = logging.getLogger("trading.notifier")
 
@@ -27,6 +29,10 @@ def _compact_usd(value: float) -> str:
     if abs_value >= 1_000:
         return f"${value/1_000:.0f}K"
     return f"${value:,.0f}"
+
+
+def format_timestamp_for_user(value) -> str:
+    return format_for_user(value)
 
 
 class TelegramTradeNotifier:
@@ -100,15 +106,23 @@ class TelegramTradeNotifier:
     def _was_handled(self, key: str, value: int | str) -> bool:
         return value in self._state.get(key, [])
 
-    def _api(self, method: str, payload: dict | None = None) -> dict:
+    def _api(
+        self,
+        method: str,
+        payload: dict | None = None,
+        *,
+        timeout_seconds: float = 8.0,
+        max_attempts: int = 3,
+        retry_sleep_seconds: float = 1.0,
+    ) -> dict:
         if not self._enabled():
             return {}
         payload = payload or {}
         url = f"https://api.telegram.org/bot{self.bot_token}/{method}"
         last_exc = None
-        for attempt in range(3):
+        for attempt in range(max_attempts):
             try:
-                response = requests.post(url, json=payload, timeout=8)
+                response = requests.post(url, json=payload, timeout=timeout_seconds)
                 response.raise_for_status()
                 data = response.json()
                 if not data.get("ok"):
@@ -118,8 +132,8 @@ class TelegramTradeNotifier:
             except Exception as exc:
                 last_exc = exc
                 self.network_available = False
-                if attempt < 2:
-                    time.sleep(1.0 + attempt)
+                if attempt < max_attempts - 1:
+                    time.sleep(retry_sleep_seconds + attempt)
         log.warning("telegram api %s failed: %s", method, last_exc)
         return {}
 
@@ -180,6 +194,19 @@ class TelegramTradeNotifier:
         self._send_message(self._format_entry_text(signal), keyboard)
         return signal_id
 
+    def get_decision(self, signal_id: str) -> str | None:
+        return self._state.get("approvals", {}).get(signal_id, {}).get("decision")
+
+    def mark_decision(self, signal_id: str, decision: str) -> str:
+        approval = self._state["approvals"].setdefault(signal_id, {})
+        approval["decision"] = decision
+        self._save_state()
+        return decision
+
+    def resolve_timeout(self, signal_id: str) -> str:
+        decision = "approved" if self.auto_approve_on_timeout else "timeout"
+        return self.mark_decision(signal_id, decision)
+
     def _format_status_message(self, status: dict) -> str:
         return (
             "🛡 <b>TRADING STATUS</b>\n"
@@ -200,11 +227,23 @@ class TelegramTradeNotifier:
             return self._format_status_message(result)
         return str(result)
 
-    def _consume_updates(self) -> list[dict]:
+    def _consume_updates(
+        self,
+        *,
+        long_poll_timeout: int = 10,
+        request_timeout: float = 8.0,
+        max_attempts: int = 3,
+    ) -> list[dict]:
         if not self._enabled():
             return []
-        payload = {"timeout": 10, "offset": int(self._state.get("offset", 0))}
-        data = self._api("getUpdates", payload)
+        payload = {"timeout": long_poll_timeout, "offset": int(self._state.get("offset", 0))}
+        data = self._api(
+            "getUpdates",
+            payload,
+            timeout_seconds=request_timeout,
+            max_attempts=max_attempts,
+            retry_sleep_seconds=0.25,
+        )
         updates = data.get("result", [])
         for update in updates:
             self._state["offset"] = max(self._state.get("offset", 0), update["update_id"] + 1)
@@ -212,8 +251,18 @@ class TelegramTradeNotifier:
             self._save_state()
         return updates
 
-    def process_pending_commands(self):
-        for update in self._consume_updates():
+    def process_pending_commands(
+        self,
+        *,
+        long_poll_timeout: int = 10,
+        request_timeout: float = 8.0,
+        max_attempts: int = 3,
+    ):
+        for update in self._consume_updates(
+            long_poll_timeout=long_poll_timeout,
+            request_timeout=request_timeout,
+            max_attempts=max_attempts,
+        ):
             self._handle_update(update)
 
     def _handle_update(self, update: dict):

@@ -1,9 +1,10 @@
 import json
 import logging
-from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+from .time_utils import iso_utc_now, parse_iso_utc, utc_now
 
 
 log = logging.getLogger("trading.executor")
@@ -94,7 +95,7 @@ class TradeExecutor:
 
         self._state["pending_entries"][signal_key] = {
             "signal_id": signal_id,
-            "queued_at": datetime.utcnow().isoformat(),
+            "queued_at": iso_utc_now(),
             "approval_timeout": int(signal.get("approval_timeout", 300)),
             "signal": signal,
         }
@@ -104,7 +105,7 @@ class TradeExecutor:
     def process_pending_entries(self) -> list[dict]:
         results = []
         pending_items = list(self._state.get("pending_entries", {}).items())
-        now = datetime.utcnow()
+        now = utc_now()
 
         for signal_key, item in pending_items:
             signal = item.get("signal") or {}
@@ -113,7 +114,7 @@ class TradeExecutor:
 
             if not decision:
                 try:
-                    queued_at = datetime.fromisoformat(item.get("queued_at", now.isoformat()))
+                    queued_at = parse_iso_utc(item.get("queued_at", now.isoformat()))
                 except Exception:
                     queued_at = now
                 elapsed = (now - queued_at).total_seconds()
@@ -258,7 +259,7 @@ class TradeExecutor:
             float(signal.get("price_usd", 0.0)),
             float(signal.get("position_size_usd", 0.0)),
         )
-        return {"ok": True, "timestamp": datetime.utcnow().isoformat()}
+        return {"ok": True, "timestamp": iso_utc_now()}
 
     def _simulate_sell(self, position) -> dict:
         log.info(
@@ -268,7 +269,7 @@ class TradeExecutor:
             float(position.current_price),
             float(position.unrealized_pnl_pct),
         )
-        return {"ok": True, "timestamp": datetime.utcnow().isoformat()}
+        return {"ok": True, "timestamp": iso_utc_now()}
 
     def emergency_close_all(self):
         closed = 0
