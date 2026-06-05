@@ -16,6 +16,7 @@ Multichain Position Manager
 
 import json
 import logging
+import os
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -27,6 +28,45 @@ from trading.time_utils import iso_utc_now, parse_iso_utc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("mc_position_mgr")
+
+
+def _load_exit_config(chain: str) -> dict:
+    chain_upper = chain.upper()
+    defaults = {
+        "bsc": {
+            "stop_loss_pct": -20.0,
+            "trailing_activation_pct": 10.0,
+            "trailing_stop_pct": 15.0,
+            "take_profit_pct": 40.0,
+            "max_hold_hours": 24.0,
+        },
+        "solana": {
+            "stop_loss_pct": -12.0,
+            "trailing_activation_pct": 5.0,
+            "trailing_stop_pct": 8.0,
+            "take_profit_pct": 20.0,
+            "max_hold_hours": 2.0,
+        },
+        "base": {
+            "stop_loss_pct": -20.0,
+            "trailing_activation_pct": 10.0,
+            "trailing_stop_pct": 15.0,
+            "take_profit_pct": 40.0,
+            "max_hold_hours": 24.0,
+        },
+    }
+    base = defaults[chain]
+    return {
+        "stop_loss_pct": float(os.getenv(f"{chain_upper}_STOP_LOSS_PCT", str(base["stop_loss_pct"]))),
+        "trailing_activation_pct": float(
+            os.getenv(f"{chain_upper}_TRAILING_ACTIVATION_PCT", str(base["trailing_activation_pct"]))
+        ),
+        "trailing_stop_pct": float(
+            os.getenv(f"{chain_upper}_TRAILING_STOP_PCT", str(base["trailing_stop_pct"]))
+        ),
+        "take_profit_pct": float(os.getenv(f"{chain_upper}_TAKE_PROFIT_PCT", str(base["take_profit_pct"]))),
+        "max_hold_hours": float(os.getenv(f"{chain_upper}_MAX_HOLD_HOURS", str(base["max_hold_hours"]))),
+    }
 
 
 # ============================================================
@@ -51,59 +91,31 @@ class ChainConfig:
 CHAIN_CONFIGS = {
     "bsc": ChainConfig(
         chain="bsc",
-        stop_loss_pct=-20.0,
-        trailing_activation_pct=10.0,
-        trailing_stop_pct=15.0,
-        take_profit_pct=80.0,
-        max_hold_hours=72,
-        capital_per_position_pct=4.0,
-        max_concurrent_positions=3,
+        **_load_exit_config("bsc"),
+        capital_per_position_pct=6.0,
+        max_concurrent_positions=4,  # monitoring-only temporary increase (2026-05-04). Re-evaluate after validation.
         liquidity_crash_pct=-20.0,
         b_holders_crash_pct=-10.0,
     ),
     "solana": ChainConfig(
         chain="solana",
-        stop_loss_pct=-25.0,
-        trailing_activation_pct=12.0,
-        trailing_stop_pct=18.0,
-        take_profit_pct=100.0,
-        max_hold_hours=48,
-        capital_per_position_pct=1.5,
-        max_concurrent_positions=4,
+        **_load_exit_config("solana"),
+        capital_per_position_pct=3.0,
+        max_concurrent_positions=2,
         liquidity_crash_pct=-25.0,
         b_holders_crash_pct=-15.0,
     ),
-    # "base": ChainConfig(
-    #     chain="base",
-    #     stop_loss_pct=-15.0,
-    #     trailing_activation_pct=8.0,
-    #     trailing_stop_pct=12.0,
-    #     take_profit_pct=60.0,
-    #     max_hold_hours=96,
-    #     capital_per_position_pct=6.0,
-    #     max_concurrent_positions=2,
-    #     liquidity_crash_pct=-18.0,
-    #     b_holders_crash_pct=-10.0,
-    # ),
-}
-
-# Disabled 2026-04-25 due to consistent losses (-$89 over 8 trades).
-# Kept separately so historical analysis and legacy open positions can
-# still resolve Base parameters without allowing new Base allocations.
-DISABLED_CHAIN_CONFIGS = {
     "base": ChainConfig(
         chain="base",
-        stop_loss_pct=-15.0,
-        trailing_activation_pct=8.0,
-        trailing_stop_pct=12.0,
-        take_profit_pct=60.0,
-        max_hold_hours=96,
+        **_load_exit_config("base"),
         capital_per_position_pct=6.0,
-        max_concurrent_positions=2,
-        liquidity_crash_pct=-18.0,
+        max_concurrent_positions=4,
+        liquidity_crash_pct=-20.0,
         b_holders_crash_pct=-10.0,
     ),
 }
+
+DISABLED_CHAIN_CONFIGS = {}
 
 
 # ============================================================
@@ -121,7 +133,9 @@ class PortfolioConfig:
     recovery_threshold: float = 0.85     # 85% 회복 시 재개
 
     # 전체 리스크 한도
-    max_total_exposure_pct: float = 15.0  # 동시 노출 자본의 15%까지만
+    max_total_exposure_pct: float = field(
+        default_factory=lambda: float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "15.0"))
+    )  # 동시 노출 자본의 15%까지만
 
 
 # ============================================================
