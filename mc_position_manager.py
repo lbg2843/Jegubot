@@ -306,6 +306,7 @@ class MultichainPositionManager:
         self.storage = Path(storage_path)
         self.state_path = Path(state_path) if state_path else self.storage.with_name("portfolio_state.json")
         self.mode = mode
+        self.halt_duration_hours = float(os.getenv("PORTFOLIO_HALT_DURATION_HOURS", "24") or 24)
 
         self.positions: dict[str, Position] = {}   # key: f"{chain}:{contract}"
         self.initial_capital: float = 0
@@ -313,6 +314,7 @@ class MultichainPositionManager:
         self.realized_pnl_total: float = 0.0
         self.halt_mode: bool = False
         self.halt_recovery_equity: float = 0
+        self.halt_until: Optional[str] = None
 
         self._load()
         self._load_state()
@@ -339,6 +341,7 @@ class MultichainPositionManager:
                             self.peak_equity = env_capital_val
             except ValueError:
                 log.warning(f"TOTAL_CAPITAL_USD invalid: {env_capital}, ignoring")
+        self._refresh_halt_state(force=True)
         self._save_state()
 
     def _pos_key(self, chain: str, contract: str) -> str:
@@ -392,16 +395,67 @@ class MultichainPositionManager:
         self.initial_capital = float(data.get("initial_capital", self.initial_capital) or 0.0)
         self.peak_equity = float(data.get("peak_equity", self.peak_equity) or 0.0)
         self.realized_pnl_total = float(data.get("realized_pnl_total", self.realized_pnl_total) or 0.0)
+        self.halt_mode = bool(data.get("halt_mode", self.halt_mode))
+        self.halt_recovery_equity = float(data.get("halt_recovery_equity", self.halt_recovery_equity) or 0.0)
+        self.halt_until = data.get("halt_until") or None
 
     def _save_state(self):
         payload = {
             "initial_capital": self.initial_capital,
             "peak_equity": self.peak_equity,
             "realized_pnl_total": self.realized_pnl_total,
+            "halt_mode": self.halt_mode,
+            "halt_recovery_equity": self.halt_recovery_equity,
+            "halt_until": self.halt_until,
             "mode": self.mode,
             "saved_at": iso_utc_now(),
         }
         _atomic_write_json(self.state_path, payload)
+
+    def _clear_halt(self):
+        self.halt_mode = False
+        self.halt_recovery_equity = 0
+        self.halt_until = None
+
+    def _refresh_halt_state(self, force: bool = False):
+        if self.mode == "dry_run":
+            if self.halt_mode or self.halt_until or self.halt_recovery_equity:
+                self._clear_halt()
+                self._save_state()
+            return
+
+        changed = False
+        current_equity = self.current_equity()
+
+        if self.peak_equity <= 0 and current_equity > 0:
+            self.peak_equity = current_equity
+            changed = True
+
+        if self.halt_mode:
+            if self.halt_until:
+                try:
+                    halt_until_dt = parse_iso_utc(self.halt_until)
+                    if datetime.now(halt_until_dt.tzinfo) >= halt_until_dt:
+                        self._clear_halt()
+                        changed = True
+                except Exception:
+                    self._clear_halt()
+                    changed = True
+            if self.halt_mode and self.halt_recovery_equity and current_equity >= self.halt_recovery_equity:
+                self._clear_halt()
+                changed = True
+
+        if force or changed:
+            self._save_state()
+
+    def reset_portfolio_halt(self, current_equity: Optional[float] = None):
+        equity = float(current_equity if current_equity is not None else (self.current_equity() or self.initial_capital or 0.0))
+        self._clear_halt()
+        if equity > 0:
+            if self.initial_capital <= 0:
+                self.initial_capital = equity
+            self.peak_equity = equity
+        self._save_state()
 
     # --------------------------------------------------------
     # 포트폴리오 체크
@@ -426,7 +480,8 @@ class MultichainPositionManager:
 
     def can_open(self, chain: str, contract: str) -> tuple[bool, str]:
         """진입 가능 여부 + 거부 사유"""
-        if self.halt_mode:
+        self._refresh_halt_state()
+        if self.mode != "dry_run" and self.halt_mode:
             return False, "portfolio_halt"
 
         key = self._pos_key(chain, contract)
@@ -439,20 +494,26 @@ class MultichainPositionManager:
             return False, f"{chain}_concurrent_full"
 
         # 전체 노출 한도
-        total_exposure_pct = sum(
-            p.size_usd / self.initial_capital * 100
-            for p in self.positions.values()
-        )
+        if self.initial_capital > 0:
+            total_exposure_pct = sum(
+                p.size_usd / self.initial_capital * 100
+                for p in self.positions.values()
+            )
+        else:
+            total_exposure_pct = 0.0
         new_position_pct = self.chain_configs[chain].capital_per_position_pct
         if total_exposure_pct + new_position_pct > self.portfolio_cfg.max_total_exposure_pct:
             return False, "total_exposure_full"
 
         # 포트폴리오 MDD 체크
-        dd = self.portfolio_drawdown()
-        if dd <= self.portfolio_cfg.portfolio_mdd_halt:
-            self.halt_mode = True
-            self.halt_recovery_equity = self.peak_equity * self.portfolio_cfg.recovery_threshold
-            return False, "mdd_halt"
+        if self.mode != "dry_run":
+            dd = self.portfolio_drawdown()
+            if dd <= self.portfolio_cfg.portfolio_mdd_halt:
+                self.halt_mode = True
+                self.halt_recovery_equity = self.peak_equity * self.portfolio_cfg.recovery_threshold
+                self.halt_until = (datetime.now().astimezone() + timedelta(hours=self.halt_duration_hours)).astimezone().isoformat()
+                self._save_state()
+                return False, "mdd_halt"
 
         return True, "ok"
 
