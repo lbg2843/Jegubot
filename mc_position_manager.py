@@ -30,6 +30,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("mc_position_mgr")
 
 
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
 def _load_exit_config(chain: str) -> dict:
     chain_upper = chain.upper()
     defaults = {
@@ -290,22 +297,62 @@ class ExitSignalEngine:
 
 class MultichainPositionManager:
     def __init__(self, chain_configs: dict, portfolio_config: PortfolioConfig,
-                 storage_path: str = "mc_positions.jsonl"):
+                 storage_path: str = "mc_positions.jsonl",
+                 state_path: Optional[str] = None,
+                 mode: str = "live"):
         self.chain_configs = chain_configs
         self.portfolio_cfg = portfolio_config
         self.engine = ExitSignalEngine(chain_configs)
         self.storage = Path(storage_path)
+        self.state_path = Path(state_path) if state_path else self.storage.with_name("portfolio_state.json")
+        self.mode = mode
 
         self.positions: dict[str, Position] = {}   # key: f"{chain}:{contract}"
         self.initial_capital: float = 0
         self.peak_equity: float = 0
+        self.realized_pnl_total: float = 0.0
         self.halt_mode: bool = False
         self.halt_recovery_equity: float = 0
 
         self._load()
+        self._load_state()
+        env_capital = os.getenv("TOTAL_CAPITAL_USD")
+        if env_capital:
+            try:
+                env_capital_val = float(env_capital)
+                if env_capital_val > 0:
+                    if self.initial_capital and abs(self.initial_capital - env_capital_val) > 0.01:
+                        log.warning(
+                            f"initial_capital recalibrated from ${self.initial_capital:.2f} "
+                            f"to ${env_capital_val:.2f} (from TOTAL_CAPITAL_USD)"
+                        )
+                    self.initial_capital = env_capital_val
+                    if self.mode == "dry_run":
+                        if self.peak_equity != env_capital_val:
+                            log.warning(
+                                f"[dry_run] peak_equity recalibrated from "
+                                f"${self.peak_equity:.2f} to ${env_capital_val:.2f}"
+                            )
+                            self.peak_equity = env_capital_val
+                    else:
+                        if self.peak_equity <= 0 or self.peak_equity < env_capital_val:
+                            self.peak_equity = env_capital_val
+            except ValueError:
+                log.warning(f"TOTAL_CAPITAL_USD invalid: {env_capital}, ignoring")
+        self._save_state()
 
     def _pos_key(self, chain: str, contract: str) -> str:
         return f"{chain}:{contract}"
+
+    def get_open_token_addresses(self, chain: Optional[str] = None) -> set[str]:
+        addresses: set[str] = set()
+        for pos in self.positions.values():
+            if chain and pos.chain != chain:
+                continue
+            contract = str(pos.contract_address or "").strip().lower()
+            if contract:
+                addresses.add(contract)
+        return addresses
 
     def _load(self):
         if not self.storage.exists():
@@ -316,16 +363,45 @@ class MultichainPositionManager:
                     d = json.loads(line)
                     pos = Position(**{k: v for k, v in d.items()
                                       if k in Position.__dataclass_fields__})
-                    if not pos.is_closed:
-                        key = self._pos_key(pos.chain, pos.contract_address)
+                    key = self._pos_key(pos.chain, pos.contract_address)
+                    if pos.is_closed:
+                        self.positions.pop(key, None)
+                        realized = pos.realized_pnl_usd
+                        if realized is None and pos.realized_pnl_pct is not None:
+                            realized = pos.size_usd * (pos.realized_pnl_pct / 100)
+                        self.realized_pnl_total += float(realized or 0.0)
+                    else:
                         self.positions[key] = pos
                 except Exception as e:
-                    log.debug(f"라인 스킵: {e}")
-        log.info(f"오픈 포지션 {len(self.positions)}개 복구")
+                    log.debug(f"jsonl load skipped: {e}")
+        log.info(f"restored {len(self.positions)} open positions")
 
     def _persist(self, pos: Position):
         with self.storage.open("a", encoding="utf-8") as f:
             f.write(json.dumps(asdict(pos), ensure_ascii=False) + "\n")
+
+    def _load_state(self):
+        if not self.state_path.exists():
+            return
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.warning(f"portfolio state load failed: {e}")
+            return
+
+        self.initial_capital = float(data.get("initial_capital", self.initial_capital) or 0.0)
+        self.peak_equity = float(data.get("peak_equity", self.peak_equity) or 0.0)
+        self.realized_pnl_total = float(data.get("realized_pnl_total", self.realized_pnl_total) or 0.0)
+
+    def _save_state(self):
+        payload = {
+            "initial_capital": self.initial_capital,
+            "peak_equity": self.peak_equity,
+            "realized_pnl_total": self.realized_pnl_total,
+            "mode": self.mode,
+            "saved_at": iso_utc_now(),
+        }
+        _atomic_write_json(self.state_path, payload)
 
     # --------------------------------------------------------
     # 포트폴리오 체크
@@ -334,10 +410,13 @@ class MultichainPositionManager:
     def current_equity(self) -> float:
         """오픈 포지션 평가 포함 현재 자본 (근사)"""
         if self.initial_capital == 0:
-            return 0
-        # 이 구현은 단순화 — 실제론 실현 손익만 반영
-        # 미실현 손익은 별도 계산 필요
-        return self.initial_capital  # placeholder
+            return 0.0
+        unrealized_pnl_total = sum(
+            p.size_usd * (p.unrealized_pnl_pct / 100.0)
+            for p in self.positions.values()
+        )
+        realized_component = 0.0 if self.mode == "dry_run" else self.realized_pnl_total
+        return self.initial_capital + realized_component + unrealized_pnl_total
 
     def portfolio_drawdown(self) -> float:
         eq = self.current_equity()
@@ -445,6 +524,8 @@ class MultichainPositionManager:
                 log.info("Portfolio halt 해제")
 
         for key, pos in list(self.positions.items()):
+            if self.mode != "dry_run":
+                self.peak_equity = max(self.peak_equity, self.current_equity())
             chain_snaps = snapshots_by_chain.get(pos.chain, [])
             snap = next(
                 (s for s in chain_snaps if s.get("contract_address") == pos.contract_address),
@@ -468,6 +549,8 @@ class MultichainPositionManager:
             else:
                 log.debug(msg)
 
+        if self.mode != "dry_run":
+            self._save_state()
         return exits
 
     def close_position(
@@ -487,24 +570,35 @@ class MultichainPositionManager:
         pos.exit_price = exit_price if exit_price is not None else pos.current_price
         pos.current_price = pos.exit_price
         pos.realized_pnl_pct = realized_pnl_pct if realized_pnl_pct is not None else pos.unrealized_pnl_pct
-        pos.realized_pnl_usd = (
-            realized_pnl_usd
-            if realized_pnl_usd is not None
-            else pos.size_usd * (pos.realized_pnl_pct / 100)
-        )
+        if realized_pnl_pct is not None:
+            pos.realized_pnl_pct = realized_pnl_pct
+        elif pos.entry_price and pos.exit_price is not None:
+            pos.realized_pnl_pct = ((pos.exit_price - pos.entry_price) / pos.entry_price) * 100.0
+        else:
+            pos.realized_pnl_pct = pos.unrealized_pnl_pct
+
+        if realized_pnl_usd is not None:
+            pos.realized_pnl_usd = realized_pnl_usd
+        elif pos.token_amount and pos.entry_price and pos.exit_price is not None:
+            pos.realized_pnl_usd = float(pos.token_amount) * (float(pos.exit_price) - float(pos.entry_price))
+        else:
+            pos.realized_pnl_usd = pos.size_usd * (pos.realized_pnl_pct / 100.0)
+        pos.exit_tx_hash = exit_tx_hash
         pos.exit_tx_hash = exit_tx_hash
 
         key = self._pos_key(pos.chain, pos.contract_address)
         del self.positions[key]
         self._persist(pos)
 
+        self.realized_pnl_total += pos.realized_pnl_usd
+
         # Peak equity 업데이트
-        new_equity = self.current_equity() + pos.realized_pnl_usd
+        new_equity = self.current_equity()
         self.peak_equity = max(self.peak_equity, new_equity)
 
-        icon = "✓" if pos.realized_pnl_pct > 0 else "✗"
-        log.info(f"{icon} [{pos.chain}] 청산: {pos.symbol} "
-                 f"{pos.realized_pnl_pct:+.2f}% (${pos.realized_pnl_usd:+,.2f}) — {msg}")
+        icon = 'WIN' if pos.realized_pnl_pct > 0 else 'LOSS'
+        log.info(f"{icon} [{pos.chain}] closed: {pos.symbol} "
+                 f"{pos.realized_pnl_pct:+.2f}% (${pos.realized_pnl_usd:+,.2f}) - {msg}")
         return pos
 
     # --------------------------------------------------------
