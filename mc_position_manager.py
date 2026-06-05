@@ -789,9 +789,9 @@ class MultichainPositionManager:
 
     def summary(self) -> str:
         if not self.positions:
-            return "오픈 포지션 없음"
+            return "No open positions"
 
-        lines = [f"── 오픈 포지션 {len(self.positions)}개 ──"]
+        lines = [f"-- Open Positions: {len(self.positions)} --"]
         by_chain = {}
         for pos in self.positions.values():
             by_chain.setdefault(pos.chain, []).append(pos)
@@ -799,15 +799,15 @@ class MultichainPositionManager:
         for chain in ["bsc", "solana", "base"]:
             if chain not in by_chain:
                 continue
-            lines.append(f"\n[{chain.upper()}] {len(by_chain[chain])}개")
+            lines.append(f"\n[{chain.upper()}] {len(by_chain[chain])}")
             for pos in by_chain[chain]:
                 pnl = pos.unrealized_pnl_pct
                 peak = pos.peak_pnl_pct
-                trail = "ON" if pos.trailing_active else "대기"
+                trail = "ON" if pos.trailing_active else "WAIT"
                 lines.append(
                     f"  {pos.symbol:<8} "
                     f"{pnl:>+7.2f}% (peak {peak:>+6.2f}%) "
-                    f"보유 {pos.hold_hours:.1f}h 트레일 {trail}"
+                    f"held {pos.hold_hours:.1f}h trail {trail}"
                 )
         return "\n".join(lines)
 
@@ -818,7 +818,7 @@ class MultichainPositionManager:
 
 def test_multichain():
     print("=" * 75)
-    print("  멀티체인 포지션 매니저 단위 테스트")
+    print("  Multichain Position Manager Unit Test")
     print("=" * 75)
 
     pf_cfg = PortfolioConfig(
