@@ -155,6 +155,7 @@ class ExitReason(Enum):
     EARLY_STOP_LOSS = "EARLY_STOP_LOSS"
     TRAILING_STOP = "TRAILING_STOP"
     TAKE_PROFIT = "TAKE_PROFIT"
+    PROFIT_LOCK_BREAK = "PROFIT_LOCK_BREAK"
     TIME_EXIT = "TIME_EXIT"
     LIQUIDITY_CRASH = "LIQUIDITY_CRASH"
     HOLDER_EXODUS = "HOLDER_EXODUS"
@@ -186,6 +187,7 @@ class Position:
 
     last_update: str = ""
     trailing_active: bool = False
+    profit_locked: bool = False
 
     # 청산
     is_closed: bool = False
@@ -275,24 +277,34 @@ class ExitSignalEngine:
                 f"[{pos.chain}] 스탑 발동: {pnl:+.2f}% ≤ {cfg.stop_loss_pct:+.0f}%"
             )
 
-        # 2. 트레일링
-        if pnl > cfg.trailing_activation_pct:
+        # 2. 트레일링 / profit lock
+        if pos.peak_pnl_pct >= cfg.trailing_activation_pct:
             pos.trailing_active = True
+
+        if not pos.profit_locked and pos.peak_pnl_pct >= cfg.take_profit_pct:
+            pos.profit_locked = True
+
+        if pos.profit_locked and pnl < cfg.take_profit_pct:
+            return True, ExitReason.PROFIT_LOCK_BREAK, (
+                f"[{pos.chain}] profit lock break: {pnl:+.2f}% < {cfg.take_profit_pct:+.0f}%"
+            )
+
         if pos.trailing_active and drawdown <= -cfg.trailing_stop_pct:
             return True, ExitReason.TRAILING_STOP, (
-                f"[{pos.chain}] 트레일링: 고점 {drawdown:+.2f}% (peak {pos.peak_pnl_pct:+.2f}%)"
+                f"[{pos.chain}] trailing stop hit: {drawdown:+.2f}% from peak (peak {pos.peak_pnl_pct:+.2f}%)"
             )
 
         # 3. 익절
-        if pnl >= cfg.take_profit_pct:
+        if pnl >= cfg.take_profit_pct and not pos.profit_locked:
+            pos.profit_locked = True
             return True, ExitReason.TAKE_PROFIT, (
-                f"[{pos.chain}] 익절: {pnl:+.2f}% ≥ {cfg.take_profit_pct:+.0f}%"
+                f"[{pos.chain}] take profit reached: {pnl:+.2f}% >= {cfg.take_profit_pct:+.0f}%"
             )
 
         # 4. 시간
         if pos.hold_hours >= cfg.max_hold_hours:
             return True, ExitReason.TIME_EXIT, (
-                f"[{pos.chain}] 시간 청산: {pos.hold_hours:.1f}h, 현재 {pnl:+.2f}%"
+                f"[{pos.chain}] time exit: held {pos.hold_hours:.1f}h, current {pnl:+.2f}%"
             )
 
         # 5. 유동성 급락
@@ -304,10 +316,10 @@ class ExitSignalEngine:
         # 6. B.holders (지원 체인만)
         if pos.entry_b_holders > 0 and pos.b_holders_change_pct <= cfg.b_holders_crash_pct:
             return True, ExitReason.HOLDER_EXODUS, (
-                f"[{pos.chain}] 홀더 이탈: {pos.b_holders_change_pct:+.2f}%"
+                f"[{pos.chain}] holder exodus: {pos.b_holders_change_pct:+.2f}%"
             )
 
-        return False, ExitReason.NONE, f"[{pos.chain}] 보유 ({pnl:+.2f}%, peak {pos.peak_pnl_pct:+.2f}%)"
+        return False, ExitReason.NONE, f"[{pos.chain}] holding ({pnl:+.2f}%, peak {pos.peak_pnl_pct:+.2f}%)"
 
 
 # ============================================================
