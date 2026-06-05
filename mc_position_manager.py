@@ -152,6 +152,7 @@ class PortfolioConfig:
 class ExitReason(Enum):
     NONE = "NONE"
     STOP_LOSS = "STOP_LOSS"
+    EARLY_STOP_LOSS = "EARLY_STOP_LOSS"
     TRAILING_STOP = "TRAILING_STOP"
     TAKE_PROFIT = "TAKE_PROFIT"
     TIME_EXIT = "TIME_EXIT"
@@ -247,13 +248,28 @@ class Position:
 class ExitSignalEngine:
     def __init__(self, chain_configs: dict):
         self.configs = chain_configs
+        self.early_stop_window_min = int(os.getenv("EARLY_STOP_WINDOW_MIN", "30") or 30)
+        self.early_stop_threshold_pct = float(os.getenv("EARLY_STOP_THRESHOLD_PCT", "-7") or -7)
+        log.info(
+            "early stop config loaded: window=%smin threshold=%s%%",
+            self.early_stop_window_min,
+            self.early_stop_threshold_pct,
+        )
 
     def evaluate(self, pos: Position) -> tuple[bool, ExitReason, str]:
         cfg = self.configs[pos.chain]
         pnl = pos.unrealized_pnl_pct
         drawdown = pos.drawdown_from_peak_pct
 
-        # 1. 스탑로스
+        held_minutes = pos.hold_hours * 60.0
+
+        # 1. early stop loss (protect weak entries in the first 30 minutes)
+        if held_minutes <= self.early_stop_window_min and pnl <= self.early_stop_threshold_pct:
+            return True, ExitReason.EARLY_STOP_LOSS, (
+                f"[{pos.chain}] early stop hit: {pnl:+.2f}% <= {self.early_stop_threshold_pct:+.0f}% within {held_minutes:.1f}m"
+            )
+
+        # 2. stop loss
         if pnl <= cfg.stop_loss_pct:
             return True, ExitReason.STOP_LOSS, (
                 f"[{pos.chain}] 스탑 발동: {pnl:+.2f}% ≤ {cfg.stop_loss_pct:+.0f}%"
