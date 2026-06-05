@@ -200,6 +200,8 @@ class Position:
 
     # 진입 경로 (reflexivity / golden_zone)
     entry_path: str = "reflexivity"
+    trending_lost_since: Optional[str] = None
+    fallback_missing_since: Optional[str] = None
 
     @property
     def unrealized_pnl_pct(self) -> float:
@@ -308,9 +310,12 @@ class ExitSignalEngine:
             )
 
         # 5. 유동성 급락
-        if pos.liquidity_change_pct <= cfg.liquidity_crash_pct:
+        # PnL 가드 추가(5/22): 유동성만 빠지고 가격 변동 거의 없는 false positive 방지
+        # AORA -0.01%, LFI +1.96%, BEAN -1.20% 같은 케이스에서 청산되던 문제 해결
+        # 진짜 crash는 가격도 같이 빠지므로 (pnl <= -5%) 통과
+        if pos.liquidity_change_pct <= cfg.liquidity_crash_pct and pnl <= -5.0:
             return True, ExitReason.LIQUIDITY_CRASH, (
-                f"[{pos.chain}] 유동성 급락: {pos.liquidity_change_pct:+.2f}%"
+                f"[{pos.chain}] liquidity crash: liq={pos.liquidity_change_pct:+.2f}% pnl={pnl:+.2f}%"
             )
 
         # 6. B.holders (지원 체인만)
@@ -338,6 +343,7 @@ class MultichainPositionManager:
         self.state_path = Path(state_path) if state_path else self.storage.with_name("portfolio_state.json")
         self.mode = mode
         self.halt_duration_hours = float(os.getenv("PORTFOLIO_HALT_DURATION_HOURS", "24") or 24)
+        self.fallback_quote_timeout_minutes = int(os.getenv("FALLBACK_QUOTE_TIMEOUT_MINUTES", "30") or 30)
 
         self.positions: dict[str, Position] = {}   # key: f"{chain}:{contract}"
         self.initial_capital: float = 0
@@ -652,20 +658,76 @@ class MultichainPositionManager:
                 None,
             )
             if not snap:
-                log.warning(f"[{pos.chain}] {pos.symbol}: Trending에서 사라짐 → 긴급 청산")
-                exits.append((pos, ExitReason.LIQUIDITY_CRASH,
-                             "Trending 페이지에서 제거됨"))
+                if pos.fallback_missing_since is None:
+                    pos.fallback_missing_since = now
+                try:
+                    missing_minutes = max(0.0, (parse_iso_utc(now) - parse_iso_utc(pos.fallback_missing_since)).total_seconds() / 60.0)
+                except Exception:
+                    missing_minutes = 0.0
+
+                # 데이터 부재(snap=None) 단독으로는 LIQUIDITY_CRASH 청산하지 않는다 (6/05).
+                # 기존 버그: fallback timeout이 PnL/유동성 가드 없이 청산 → LFI(+9.70%),
+                # aeon(+1.92%), hTEA(+2.48%) 같은 플러스 포지션이 강제 청산되던 문제.
+                # 마지막 유효 관측 기준으로 (a) 실제 유동성 급감 + 손실일 때만 LIQUIDITY_CRASH,
+                # (b) 그 외에는 보유 유지, max_hold_hours 도달 시 TIME_EXIT로 정상 청산.
+                cfg = self.chain_configs[pos.chain]
+                pnl = pos.unrealized_pnl_pct                 # 마지막 유효 가격 기준
+                liq_change = pos.liquidity_change_pct        # 마지막 유효 snapshot 기준
+                real_crash = (liq_change <= cfg.liquidity_crash_pct) and (pnl <= -5.0)
+
+                if missing_minutes >= self.fallback_quote_timeout_minutes and real_crash:
+                    exits.append((
+                        pos,
+                        ExitReason.LIQUIDITY_CRASH,
+                        f"fallback_timeout_{self.fallback_quote_timeout_minutes}min_"
+                        f"liq{liq_change:+.2f}%_pnl{pnl:+.2f}%",
+                    ))
+                elif pos.hold_hours >= cfg.max_hold_hours:
+                    # quote 영구 미수신 대비: 보유시간 한도 도달 시 정상 TIME_EXIT
+                    exits.append((
+                        pos,
+                        ExitReason.TIME_EXIT,
+                        f"fallback_time_exit_{pos.hold_hours:.1f}h_pnl{pnl:+.2f}%",
+                    ))
+                else:
+                    log.warning(
+                        f"[{pos.chain}] {pos.symbol}: fallback quote missing for {missing_minutes:.0f}min "
+                        f"(timeout {self.fallback_quote_timeout_minutes}min) — holding "
+                        f"(pnl={pnl:+.2f}% liq={liq_change:+.2f}%)"
+                    )
                 continue
 
+            pos.fallback_missing_since = None
             pos.current_price = snap["price_usd"]
             pos.peak_price = max(pos.peak_price, snap["price_usd"])
             pos.current_liquidity = snap["liquidity_usd"]
             pos.current_b_holders = snap.get("holders_binance", pos.current_b_holders)
             pos.last_update = now
 
+            if snap.get("_fallback_disappearance"):
+                if pos.trending_lost_since is None:
+                    pos.trending_lost_since = now
+                try:
+                    lost_minutes = max(0.0, (parse_iso_utc(now) - parse_iso_utc(pos.trending_lost_since)).total_seconds() / 60.0)
+                except Exception:
+                    lost_minutes = 0.0
+                log.warning(
+                    f"[{pos.chain}] {pos.symbol}: trending_lost_fallback_active for {lost_minutes:.0f}min "
+                    f"(price=${pos.current_price:.6f} liq=${pos.current_liquidity:,.0f})"
+                )
+            else:
+                pos.trending_lost_since = None
+
             should_exit, reason, msg = self.engine.evaluate(pos)
             if should_exit:
-                exits.append((pos, reason, msg))
+                if reason == ExitReason.LIQUIDITY_CRASH:
+                    exits.append((
+                        pos,
+                        reason,
+                        f"real_liquidity_drop_{pos.liquidity_change_pct:+.2f}%",
+                    ))
+                else:
+                    exits.append((pos, reason, msg))
             else:
                 log.debug(msg)
 
