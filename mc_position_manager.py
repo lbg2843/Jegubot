@@ -195,6 +195,9 @@ class Position:
     realized_pnl_usd: Optional[float] = None
     exit_tx_hash: Optional[str] = None
 
+    # 진입 경로 (reflexivity / golden_zone)
+    entry_path: str = "reflexivity"
+
     @property
     def unrealized_pnl_pct(self) -> float:
         if self.entry_price == 0:
@@ -524,8 +527,11 @@ class MultichainPositionManager:
     def open_position(self, chain: str, token_snapshot: dict,
                       total_capital_usd: float) -> Optional[Position]:
         if self.initial_capital == 0:
-            self.initial_capital = total_capital_usd
-            self.peak_equity = total_capital_usd
+            env_capital = os.getenv("TOTAL_CAPITAL_USD")
+            if not env_capital:
+                self.initial_capital = total_capital_usd
+                if self.mode != "dry_run":
+                    self.peak_equity = total_capital_usd
 
         contract = token_snapshot.get("contract_address")
         can, reason = self.can_open(chain, contract)
@@ -535,13 +541,34 @@ class MultichainPositionManager:
 
         cfg = self.chain_configs[chain]
         dd = self.portfolio_drawdown()
-        # Circuit breaker: MDD 경고 시 포지션 크기 절반
-        size_pct = cfg.capital_per_position_pct
-        if dd <= self.portfolio_cfg.portfolio_mdd_warn:
-            size_pct *= 0.5
-            log.warning(f"MDD 경고 구간, 포지션 사이즈 축소 → {size_pct:.1f}%")
+        fixed_size_env = {
+            "bsc": "BSC_POSITION_SIZE_USD",
+            "solana": "SOLANA_POSITION_SIZE_USD",
+            "base": "BASE_POSITION_SIZE_USD",
+        }.get(chain)
+        fixed_size_usd = None
+        fixed_size_raw = os.getenv(fixed_size_env) if fixed_size_env else None
+        if fixed_size_raw:
+            try:
+                fixed_size_usd = float(fixed_size_raw)
+                if fixed_size_usd <= 0:
+                    fixed_size_usd = None
+            except ValueError:
+                fixed_size_usd = None
 
-        size_usd = total_capital_usd * (size_pct / 100)
+        if fixed_size_usd is not None:
+            size_usd = fixed_size_usd
+            if dd <= self.portfolio_cfg.portfolio_mdd_warn:
+                size_usd *= 0.5
+                log.warning(f"MDD 경고 구간, 포지션 사이즈 축소 → ${size_usd:.2f}")
+            size_pct_for_log = (size_usd / self.initial_capital * 100) if self.initial_capital > 0 else 0.0
+        else:
+            size_pct = cfg.capital_per_position_pct
+            if dd <= self.portfolio_cfg.portfolio_mdd_warn:
+                size_pct *= 0.5
+                log.warning(f"MDD 경고 구간, 포지션 사이즈 축소 → {size_pct:.1f}%")
+            size_usd = total_capital_usd * (size_pct / 100)
+            size_pct_for_log = size_pct
         now = iso_utc_now()
 
         pos = Position(
@@ -555,6 +582,7 @@ class MultichainPositionManager:
             size_usd=size_usd,
             token_amount=float(token_snapshot.get("_token_amount") or 0.0),
             entry_tx_hash=token_snapshot.get("_entry_tx_hash"),
+            entry_path=str(token_snapshot.get("entry_path") or "reflexivity"),
             current_price=token_snapshot["price_usd"],
             peak_price=token_snapshot["price_usd"],
             current_liquidity=token_snapshot["liquidity_usd"],
@@ -563,8 +591,11 @@ class MultichainPositionManager:
         )
         self.positions[self._pos_key(chain, contract)] = pos
         self._persist(pos)
-        log.info(f"▶ [{chain}] 진입: {pos.symbol} @ ${pos.entry_price:.6f} "
-                 f"(${size_usd:,.0f}, {size_pct:.1f}%, 유동성 ${pos.entry_liquidity/1000:.0f}K)")
+        self._save_state()
+        log.info(
+            f"[{chain}] entry via {pos.entry_path}: {pos.symbol} @ ${pos.entry_price:.6f} "
+            f"(${size_usd:,.0f}, {size_pct_for_log:.1f}%, liq=${pos.entry_liquidity/1000:.0f}K)"
+        )
         return pos
 
     # --------------------------------------------------------
