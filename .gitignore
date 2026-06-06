@@ -28,3 +28,37 @@ htmlcov/
 
 *.tmp
 *.bak
+
+# --- cleanup 2026-06-07 ---
+# local virtualenv (was untracked; dir is venv311/, not venv/)
+venv311/
+
+# config snapshots (.env backups) — kept on disk for analysis, NOT committed
+# (contain secrets). README is the only tracked file in there.
+config_history/*
+!config_history/README.md
+
+# one-off scratch / analysis / diagnostic scripts (kept on disk, not tracked).
+# NOTE: live modules imported by orchestrator (entry_logger, eth_macro_filter,
+# score_model, score_outcome_tracker, shadow_rules) and branch work
+# (simulate_multi_models, sim_safety_gate, clean_positions_jsonl) are NOT here.
+/_*.py
+analyze_*.py
+diag_*.py
+dump_*.py
+find_*.py
+band_analysis.py
+bill_5_12_outcome.py
+bsc_alt_path_backtest.py
+btc_correlation.py
+btc_correlation_detail.py
+check_cycle_raw.py
+exit_analysis.py
+exit_sim.py
+final_score_analysis.py
+match_check.py
+path_join.py
+read_positions.py
+sl_diagnose.py
+sl_sim.py
+sweet_traj.py
