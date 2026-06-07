@@ -62,3 +62,34 @@ read_positions.py
 sl_diagnose.py
 sl_sim.py
 sweet_traj.py
+
+# --- scratch / analysis dumps (2026-06-07) — kept on disk, not tracked ---
+# timestamped backups (note: *.bak already ignored above; *.bak_<date> is not)
+*.bak_*
+# root-level scratch dumps / handoffs (requirements.txt stays tracked)
+/*_view.txt
+/orch_main.txt
+/exit_lines.txt
+/lab_snapshots_*.txt
+/run_forever_test2.txt
+/trailing_compare.txt
+/*handoff*.md
+/candidate_sample.json
+/closed_positions.jsonl
+/score_outcomes_sample.jsonl
+/validate_*.ps1
+# reports/ is scratch-by-default; track curated reports via explicit ! exceptions
+reports/*
+!reports/recency_revalidation_uncensored_2026-06-07.md
+!reports/recency_soft_weight_analysis_2026-06-07.md
+# data/ runtime state, locks, backups, analysis outputs (nothing in data/ is tracked)
+data/_tmp_*
+data/atomic_test/
+data/*.lock
+data/*.backup
+data/portfolio_state*.json
+data/golden_zone_*.json
+data/run_heartbeat.json
+data/token_age_analysis.json
+data/trade_executor_state*.json
+data/trading_safety_state.backup*.json
