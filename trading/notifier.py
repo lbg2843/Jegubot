@@ -49,7 +49,7 @@ class TelegramTradeNotifier:
         self.state_path = Path(state_path)
         self.auto_approve_on_timeout = auto_approve_on_timeout
         self.poll_interval = poll_interval
-        self._handlers: dict[str, Callable[[], Any]] = {}
+        self._handlers: dict[str, Callable[..., Any]] = {}
         self._state = {
             "offset": 0,
             "approvals": {},
@@ -65,6 +65,7 @@ class TelegramTradeNotifier:
         status_handler: Callable[[], dict] | None = None,
         stop_handler: Callable[[], str] | None = None,
         unhalt_handler: Callable[[], str] | None = None,
+        close_handler: Callable[[str], str] | None = None,
     ):
         if status_handler:
             self._handlers["status"] = status_handler
@@ -72,6 +73,8 @@ class TelegramTradeNotifier:
             self._handlers["stop"] = stop_handler
         if unhalt_handler:
             self._handlers["unhalt"] = unhalt_handler
+        if close_handler:
+            self._handlers["close"] = close_handler
 
     def _load_state(self):
         if not self.state_path.exists():
@@ -177,22 +180,36 @@ class TelegramTradeNotifier:
             "⏱ 5분 후 자동 승인"
         )
 
-    def send_entry_signal(self, signal: dict) -> str:
+    def create_pending_approval(self, signal: dict, *, auto_entry: bool = False) -> str:
         signal_id = signal.get("signal_id") or uuid.uuid4().hex[:12]
         signal["signal_id"] = signal_id
         self._state["approvals"][signal_id] = {
-            "decision": None,
+            "decision": "auto_approved" if auto_entry else None,
             "signal": signal,
         }
         self._save_state()
-        keyboard = {
+        return signal_id
+
+    def send_entry_signal(self, signal: dict) -> str:
+        approval_timeout = int(signal.get("approval_timeout", 300) or 0)
+        auto_entry = self.auto_approve_on_timeout and approval_timeout <= 0
+        signal_id = self.create_pending_approval(signal, auto_entry=auto_entry)
+        keyboard = None if auto_entry else {
             "inline_keyboard": [[
                 {"text": "BUY", "callback_data": f"trade:buy:{signal_id}"},
                 {"text": "SKIP", "callback_data": f"trade:skip:{signal_id}"},
             ]]
         }
-        self._send_message(self._format_entry_text(signal), keyboard)
+        text = self._format_entry_text(signal)
+        if auto_entry:
+            text += "\n\nAuto-entry: enabled (executing without manual approval)"
+        self._send_message(text, keyboard)
         return signal_id
+
+    def send_entry_notification(self, signal: dict) -> bool:
+        text = self._format_entry_text(signal) + "\n\nExecution: confirmed"
+        response = self._send_message(text)
+        return bool(response)
 
     def get_decision(self, signal_id: str) -> str | None:
         return self._state.get("approvals", {}).get(signal_id, {}).get("decision")
@@ -218,11 +235,19 @@ class TelegramTradeNotifier:
         )
 
     def _process_command(self, text: str):
-        command = text.lstrip("/").split("@", 1)[0].split()[0].lower()
+        parts = text.lstrip("/").split()
+        if not parts:
+            return None
+        command = parts[0].split("@", 1)[0].lower()
+        args = parts[1:]
         handler = self._handlers.get(command)
         if not handler:
             return None
-        result = handler()
+        if command == "close":
+            symbol = args[0] if args else ""
+            result = handler(symbol)
+        else:
+            result = handler()
         if isinstance(result, dict):
             return self._format_status_message(result)
         return str(result)
