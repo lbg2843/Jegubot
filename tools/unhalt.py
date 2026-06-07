@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -30,14 +30,19 @@ def main():
     print("\n현재 상태:")
     print(f"  halt_until: {state.get('halt_until')}")
     print(f"  halt_reason: {state.get('halt_reason')}")
+    print(f"  daily_pnl_usd: {state.get('daily_pnl_usd', 0.0)}")
+    print(f"  daily_trades: {state.get('daily_trades', 0)}")
     print(f"  consecutive_losses: {state.get('consecutive_losses', 0)}")
     print(f"  recent_losses: {len(state.get('recent_losses') or [])}")
 
     state["halt_until"] = None
     state["halt_reason"] = None
+    state["daily_pnl_usd"] = 0.0
+    state["daily_trades"] = 0
     state["consecutive_losses"] = 0
     state["recent_losses"] = []
     state["halt_count_today"] = 0
+    state["last_reset_date"] = datetime.now(timezone.utc).date().isoformat()
 
     STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
     print("\nOK: Halt cleared. Bot restart required.")
