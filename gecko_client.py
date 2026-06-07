@@ -10,7 +10,7 @@ API 키 불필요. Rate limit: 30 req/min.
 import requests
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 log = logging.getLogger("gecko_client")
@@ -39,12 +39,15 @@ class TrendingToken:
     contract_address: str
 
     price_usd: float
+    price_change_5m_pct: float
+    price_change_15m_pct: float
     price_change_1h_pct: float
     price_change_24h_pct: Optional[float]
     market_cap_usd: Optional[float]
 
     liquidity_usd: float       # reserve_in_usd
     volume_1h_usd: float
+    volume_24h_usd: float
     txns_1h: int               # h1 buys + sells
 
     holders_total: int         # 별도 API 필요, 기본 0
@@ -54,8 +57,13 @@ class TrendingToken:
     lp_locked: Optional[bool]
 
     # DEX/풀 정보 (GeckoTerminal 추가 필드)
+    pool_age_hours: Optional[float] = None
     pool_address: str = ""
     dex_id: str = ""
+
+    # h1 매수/매도 건수 (txns_1h = buys_1h + sells_1h). buy_pressure 점수 입력.
+    buys_1h: int = 0
+    sells_1h: int = 0
 
     @property
     def avg_tx_size_usd(self) -> float:
@@ -145,9 +153,22 @@ def _normalize(pool: dict, token_map: dict, chain: str, timestamp: str) -> Trend
     # 가격 변동
     price_chg = attr.get("price_change_percentage", {})
 
-    # 트랜잭션 수 (h1 buys + sells)
+    # 트랜잭션 수 (h1 buys / sells). 개별 값도 보존해야 buy_pressure 점수가 산다.
     txns_h1 = attr.get("transactions", {}).get("h1", {})
-    txns_1h = (txns_h1.get("buys") or 0) + (txns_h1.get("sells") or 0)
+    buys_1h = int(txns_h1.get("buys") or 0)
+    sells_1h = int(txns_h1.get("sells") or 0)
+    txns_1h = buys_1h + sells_1h
+
+    # 풀 나이 계산 (pool_created_at → pool_age_hours)
+    pool_age_hours: Optional[float] = None
+    pool_created_at = attr.get("pool_created_at")
+    if pool_created_at:
+        try:
+            created_dt = datetime.fromisoformat(pool_created_at.replace("Z", "+00:00"))
+            now_dt = datetime.now(timezone.utc)
+            pool_age_hours = (now_dt - created_dt).total_seconds() / 3600
+        except Exception:
+            pool_age_hours = None
 
     return TrendingToken(
         timestamp=timestamp,
@@ -156,12 +177,18 @@ def _normalize(pool: dict, token_map: dict, chain: str, timestamp: str) -> Trend
         name=tok.get("name", ""),
         contract_address=tok.get("address", ""),
         price_usd=float(attr.get("base_token_price_usd") or 0),
+        price_change_5m_pct=float(price_chg.get("m5") or 0),
+        price_change_15m_pct=float(price_chg.get("m15") or 0),
         price_change_1h_pct=float(price_chg.get("h1") or 0),
         price_change_24h_pct=float(price_chg.get("h24") or 0) if price_chg.get("h24") else None,
         market_cap_usd=float(attr.get("market_cap_usd") or 0) or None,
         liquidity_usd=float(attr.get("reserve_in_usd") or 0),
         volume_1h_usd=float(attr.get("volume_usd", {}).get("h1") or 0),
+        volume_24h_usd=float(attr.get("volume_usd", {}).get("h24") or 0),
         txns_1h=txns_1h,
+        buys_1h=buys_1h,
+        sells_1h=sells_1h,
+        pool_age_hours=pool_age_hours,
         holders_total=0,
         holders_binance=0,
         audit_flags=[],
