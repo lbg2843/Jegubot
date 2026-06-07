@@ -9,6 +9,7 @@ import base64
 import logging
 import os
 import socket
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -65,8 +66,25 @@ class Jupiter:
             return "DNS lookup failed for api.jup.ag"
         return str(exc)
 
+    def _rpc_call_with_retry(self, fn, *args, **kwargs):
+        delays = (0.4, 1.0, 2.0)
+        last_exc = None
+        for idx, delay in enumerate(delays, start=1):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                message = str(exc)
+                if "429" not in message and "Too Many Requests" not in message:
+                    raise
+                log.warning("solana rpc rate limited, retrying (%s/%s): %s", idx, len(delays), message)
+                if idx == len(delays):
+                    break
+                time.sleep(delay)
+        raise last_exc
+
     def _get_mint_decimals(self, mint_address: str) -> int:
-        mint_info = self.client.get_account_info_json_parsed(Pubkey.from_string(mint_address))
+        mint_info = self._rpc_call_with_retry(self.client.get_account_info_json_parsed, Pubkey.from_string(mint_address))
         value = mint_info.value
         if value is None:
             raise ValueError(f"Mint not found: {mint_address}")
@@ -118,45 +136,66 @@ class Jupiter:
 
     def _send_signed(self, versioned_tx: VersionedTransaction) -> str:
         signed_tx = VersionedTransaction(versioned_tx.message, [self.wallet.keypair])
-        send_resp = self.client.send_raw_transaction(
+        send_resp = self._rpc_call_with_retry(
+            self.client.send_raw_transaction,
             bytes(signed_tx),
             opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"),
         )
         tx_sig = str(send_resp.value)
         log.info("jupiter tx sent: %s", tx_sig)
-        self.client.confirm_transaction(send_resp.value, commitment="confirmed")
+        self._rpc_call_with_retry(self.client.confirm_transaction, send_resp.value, commitment="confirmed")
         return tx_sig
 
     def buy(self, target_token_mint: str, amount_usdc: float, slippage_pct: float = 2.5) -> JupiterSwapResult:
+        slippage_bps = int(slippage_pct * 100)
         try:
-            slippage_bps = int(slippage_pct * 100)
             target_before = self.wallet.get_token_balance(target_token_mint)
             quote = self.quote_buy_in_usdc(target_token_mint, amount_usdc, slippage_bps)
+        except Exception as exc:
+            return JupiterSwapResult(success=False, error=f"quote_buy_failed: {self._friendly_error(exc)}")
+
+        try:
             versioned_tx = self._build_swap_transaction(quote)
+        except Exception as exc:
+            return JupiterSwapResult(success=False, error=f"swap_build_failed: {self._friendly_error(exc)}")
+
+        try:
             tx_sig = self._send_signed(versioned_tx)
             target_after = self.wallet.get_token_balance(target_token_mint)
+            balance_delta = max(0.0, target_after - target_before)
+            quoted_out = int(quote.get("outAmount") or 0) / (10 ** quote.get("outputDecimals", 9))
             return JupiterSwapResult(
                 success=True,
                 tx_signature=tx_sig,
                 amount_in=amount_usdc,
-                amount_out=max(0.0, target_after - target_before),
+                amount_out=balance_delta if balance_delta > 0 else quoted_out,
             )
         except Exception as exc:
-            return JupiterSwapResult(success=False, error=self._friendly_error(exc))
+            return JupiterSwapResult(success=False, error=f"swap_send_failed: {self._friendly_error(exc)}")
 
     def sell(self, token_mint: str, amount_token: float, slippage_pct: float = 2.5) -> JupiterSwapResult:
+        slippage_bps = int(slippage_pct * 100)
         try:
-            slippage_bps = int(slippage_pct * 100)
             usdc_before = self.wallet.get_usdc_balance()
             quote = self.quote_sell_to_usdc(token_mint, amount_token, slippage_bps)
+        except Exception as exc:
+            return JupiterSwapResult(success=False, error=f"quote_sell_failed: {self._friendly_error(exc)}")
+
+        try:
             versioned_tx = self._build_swap_transaction(quote)
+        except Exception as exc:
+            return JupiterSwapResult(success=False, error=f"swap_build_failed: {self._friendly_error(exc)}")
+
+        try:
             tx_sig = self._send_signed(versioned_tx)
             usdc_after = self.wallet.get_usdc_balance()
+            balance_delta = max(0.0, usdc_after - usdc_before)
+            quoted_out = int(quote.get("outAmount") or 0) / 10**6
             return JupiterSwapResult(
                 success=True,
                 tx_signature=tx_sig,
                 amount_in=amount_token,
-                amount_out=max(0.0, usdc_after - usdc_before),
+                amount_out=balance_delta if balance_delta > 0 else quoted_out,
             )
         except Exception as exc:
-            return JupiterSwapResult(success=False, error=self._friendly_error(exc))
+            return JupiterSwapResult(success=False, error=f"swap_send_failed: {self._friendly_error(exc)}")

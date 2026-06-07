@@ -1,4 +1,5 @@
 import os
+import time
 
 import base58
 from solana.rpc.api import Client
@@ -37,8 +38,24 @@ class SolanaWallet:
                 f"but SOLANA_WALLET_ADDRESS is {self.address}"
             )
 
+    def _rpc_call_with_retry(self, fn, *args, **kwargs):
+        delays = (0.4, 1.0, 2.0)
+        last_exc = None
+        for idx, delay in enumerate(delays, start=1):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                message = str(exc)
+                if "429" not in message and "Too Many Requests" not in message:
+                    raise
+                if idx == len(delays):
+                    break
+                time.sleep(delay)
+        raise last_exc
+
     def get_sol_balance(self) -> float:
-        resp = self.client.get_balance(self.keypair.pubkey())
+        resp = self._rpc_call_with_retry(self.client.get_balance, self.keypair.pubkey())
         return resp.value / 1e9
 
     def get_token_balance(self, mint_address: str) -> float:
@@ -47,7 +64,7 @@ class SolanaWallet:
 
         try:
             opts = TokenAccountOpts(mint=mint_pubkey)
-            resp = self.client.get_token_accounts_by_owner_json_parsed(owner, opts)
+            resp = self._rpc_call_with_retry(self.client.get_token_accounts_by_owner_json_parsed, owner, opts)
             if not resp.value:
                 return 0.0
 
