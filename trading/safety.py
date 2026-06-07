@@ -1,10 +1,18 @@
 import json
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List
 
 from .time_utils import parse_iso_utc, utc_now
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 @dataclass
@@ -61,11 +69,7 @@ class SafetyCircuitBreaker:
             self.state.recent_losses = []
 
     def _save(self):
-        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-        self.storage_path.write_text(
-            json.dumps(asdict(self.state), ensure_ascii=True, indent=2),
-            encoding="utf-8",
-        )
+        _atomic_write_json(self.storage_path, asdict(self.state))
 
     def reset_daily_if_needed(self):
         today = utc_now().date().isoformat()

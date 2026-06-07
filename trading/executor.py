@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -8,6 +9,13 @@ from .time_utils import iso_utc_now, parse_iso_utc, utc_now
 
 
 log = logging.getLogger("trading.executor")
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 class ManualExitReason(str, Enum):
@@ -20,10 +28,22 @@ class TradeExecutor:
         self.notifier = notifier
         self.safety = safety
         self.mode = mode
+        self.max_open_positions = int(os.getenv("MAX_OPEN_POSITIONS", "4"))
+        self.wallet_balance_cache_ttl_sec = int(os.getenv("WALLET_BALANCE_CACHE_TTL_SEC", "45"))
+        self.stop_loss_cooldown_minutes = int(os.getenv("STOP_LOSS_COOLDOWN_MINUTES", "60"))
+        # DEPRECATED: reason별 차등 cooldown으로 대체. _get_cooldown_minutes_by_reason() 참조.
+        self.reentry_cooldown_minutes = int(os.getenv("POSITION_REENTRY_COOLDOWN_MINUTES", "120"))
         self.state_path = Path(state_path) if state_path else None
-        self._state = {"pending_entries": {}}
+        self._state = {
+            "pending_entries": {},
+            "exit_failures": {},
+            "wallet_mismatches": {},
+            "stop_loss_cooldowns": {},
+            "reentry_cooldowns": {},
+        }
         self._bsc_wallet = None
         self._sol_wallet = None
+        self._wallet_balance_cache: dict[str, dict] = {}
         self._load_state()
         if self.mode == "live":
             log.info("live mode enabled for trade executor")
@@ -34,17 +54,147 @@ class TradeExecutor:
         try:
             self._state = json.loads(self.state_path.read_text(encoding="utf-8"))
             self._state.setdefault("pending_entries", {})
+            self._state.setdefault("exit_failures", {})
+            self._state.setdefault("wallet_mismatches", {})
+            self._state.setdefault("stop_loss_cooldowns", {})
+            self._state.setdefault("reentry_cooldowns", {})
+            self._prune_stop_loss_cooldowns(save=False)
+            self._prune_reentry_cooldowns(save=False)
         except Exception:
-            self._state = {"pending_entries": {}}
+            self._state = {
+                "pending_entries": {},
+                "exit_failures": {},
+                "wallet_mismatches": {},
+                "stop_loss_cooldowns": {},
+                "reentry_cooldowns": {},
+            }
 
     def _save_state(self):
         if not self.state_path:
             return
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(
-            json.dumps(self._state, ensure_ascii=True, indent=2),
-            encoding="utf-8",
+        _atomic_write_json(self.state_path, self._state)
+
+    def _prune_stop_loss_cooldowns(self, save: bool = True) -> None:
+        cooldowns = self._state.setdefault("stop_loss_cooldowns", {})
+        ttl_seconds = max(0, int(self.stop_loss_cooldown_minutes)) * 60
+        if ttl_seconds <= 0 or not cooldowns:
+            return
+        now = utc_now()
+        removed = []
+        for key, payload in list(cooldowns.items()):
+            try:
+                last_stop = parse_iso_utc(payload.get("last_stop_at"))
+            except Exception:
+                removed.append(key)
+                continue
+            if (now - last_stop).total_seconds() >= ttl_seconds:
+                removed.append(key)
+        for key in removed:
+            cooldowns.pop(key, None)
+        if removed and save:
+            self._save_state()
+
+    def _active_stop_loss_cooldown(self, signal: dict):
+        self._prune_stop_loss_cooldowns(save=False)
+        key = self._signal_key(signal)
+        payload = self._state.setdefault("stop_loss_cooldowns", {}).get(key)
+        if not payload:
+            return None
+        try:
+            last_stop = parse_iso_utc(payload.get("last_stop_at"))
+        except Exception:
+            self._state["stop_loss_cooldowns"].pop(key, None)
+            self._save_state()
+            return None
+        ttl_seconds = max(0, int(self.stop_loss_cooldown_minutes)) * 60
+        elapsed = (utc_now() - last_stop).total_seconds()
+        if elapsed >= ttl_seconds:
+            self._state["stop_loss_cooldowns"].pop(key, None)
+            self._save_state()
+            return None
+        payload = dict(payload)
+        payload["remaining_seconds"] = max(0, int(ttl_seconds - elapsed))
+        return payload
+
+    def _get_cooldown_minutes_by_reason(self, reason: str) -> int:
+        reason_env_map = {
+            "STOP_LOSS": "COOLDOWN_STOP_LOSS_MINUTES",
+            "LIQUIDITY_CRASH": "COOLDOWN_LIQUIDITY_CRASH_MINUTES",
+            "TIME_EXIT": "COOLDOWN_TIME_EXIT_MINUTES",
+            "TRAILING_STOP": "COOLDOWN_TRAILING_STOP_MINUTES",
+            "TAKE_PROFIT": "COOLDOWN_TAKE_PROFIT_MINUTES",
+            "PROFIT_LOCK_BREAK": "COOLDOWN_PROFIT_LOCK_BREAK_MINUTES",
+            "HOLDER_EXODUS": "COOLDOWN_HOLDER_EXODUS_MINUTES",
+        }
+        env_key = reason_env_map.get(reason)
+        if env_key:
+            raw = os.getenv(env_key)
+            if raw:
+                try:
+                    return int(raw)
+                except ValueError:
+                    pass
+
+        fallback = (
+            os.getenv("COOLDOWN_DEFAULT_MINUTES")
+            or os.getenv("POSITION_REENTRY_COOLDOWN_MINUTES")
+            or "120"
         )
+        try:
+            return int(fallback)
+        except ValueError:
+            return 120
+
+    def _prune_reentry_cooldowns(self, save: bool = True) -> None:
+        cooldowns = self._state.setdefault("reentry_cooldowns", {})
+        if not cooldowns:
+            return
+        now = utc_now()
+        removed = []
+        for key, payload in list(cooldowns.items()):
+            try:
+                last_exit = parse_iso_utc(payload.get("last_exit_at"))
+            except Exception:
+                removed.append(key)
+                continue
+            exit_reason = payload.get("exit_reason", "DEFAULT")
+            cooldown_minutes = self._get_cooldown_minutes_by_reason(exit_reason)
+            ttl_seconds = max(0, int(cooldown_minutes)) * 60
+            if ttl_seconds <= 0:
+                removed.append(key)
+                continue
+            if (now - last_exit).total_seconds() >= ttl_seconds:
+                removed.append(key)
+        for key in removed:
+            cooldowns.pop(key, None)
+        if removed and save:
+            self._save_state()
+
+    def _active_reentry_cooldown(self, signal: dict):
+        self._prune_reentry_cooldowns(save=False)
+        key = self._signal_key(signal)
+        payload = self._state.setdefault("reentry_cooldowns", {}).get(key)
+        if not payload:
+            return None
+        try:
+            last_exit = parse_iso_utc(payload.get("last_exit_at"))
+        except Exception:
+            self._state["reentry_cooldowns"].pop(key, None)
+            self._save_state()
+            return None
+        exit_reason = payload.get("exit_reason", "DEFAULT")
+        cooldown_minutes = self._get_cooldown_minutes_by_reason(exit_reason)
+        ttl_seconds = max(0, int(cooldown_minutes)) * 60
+        elapsed = (utc_now() - last_exit).total_seconds()
+        if elapsed >= ttl_seconds:
+            self._state["reentry_cooldowns"].pop(key, None)
+            self._save_state()
+            return None
+        payload = dict(payload)
+        payload["remaining_seconds"] = max(0, int(ttl_seconds - elapsed))
+        payload["cooldown_minutes"] = cooldown_minutes
+        payload["exit_reason"] = payload.get("exit_reason", "unknown")
+        return payload
 
     def _signal_key(self, signal: dict) -> str:
         chain = signal.get("chain", "?")
@@ -54,22 +204,168 @@ class TradeExecutor:
     def _open_position_exists(self, signal: dict) -> bool:
         return self._signal_key(signal) in self.position_manager.positions
 
+    def _at_open_position_limit(self) -> bool:
+        return len(self.position_manager.positions) >= self.max_open_positions
+
     def _finalize_pending(self, signal_key: str):
         self._state["pending_entries"].pop(signal_key, None)
         self._save_state()
+
+    def _position_key(self, position) -> str:
+        return f"{position.chain}:{position.contract_address}"
+
+    def _estimate_token_amount(self, position) -> float:
+        explicit = float(getattr(position, "token_amount", 0.0) or 0.0)
+        if explicit > 0:
+            return explicit
+        entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
+        size_usd = float(getattr(position, "size_usd", 0.0) or 0.0)
+        if entry_price > 0 and size_usd > 0:
+            return size_usd / entry_price
+        return 0.0
+
+    def _try_get_wallet_token_balance(self, chain: str, token: str) -> tuple[bool, float]:
+        wallet = self._get_live_wallet(chain)
+        if wallet is None or not token:
+            return False, 0.0
+
+        cache_key = f"{str(chain).lower()}:{token}"
+        ttl = max(0, int(self.wallet_balance_cache_ttl_sec))
+        cached = self._wallet_balance_cache.get(cache_key)
+        if cached and ttl > 0:
+            try:
+                age = (utc_now() - parse_iso_utc(cached["checked_at"])).total_seconds()
+            except Exception:
+                age = ttl + 1
+            if age <= ttl:
+                return bool(cached.get("ok")), float(cached.get("balance", 0.0))
+
+        try:
+            result = (True, float(wallet.get_token_balance(token) or 0.0))
+        except Exception as exc:
+            log.warning("wallet token balance lookup failed: [%s] %s %s", chain, token, exc)
+            result = (False, 0.0)
+
+        self._wallet_balance_cache[cache_key] = {
+            "ok": result[0],
+            "balance": result[1],
+            "checked_at": iso_utc_now(),
+        }
+        return result
+
+    def _get_wallet_token_balance(self, chain: str, token: str) -> float:
+        ok, balance = self._try_get_wallet_token_balance(chain, token)
+        return balance if ok else 0.0
+
+    def _get_exit_failure_state(self, position) -> dict:
+        return self._state.setdefault("exit_failures", {}).setdefault(
+            self._position_key(position),
+            {
+                "count": 0,
+                "last_attempt_at": None,
+                "last_error": None,
+                "notified_manual": False,
+            },
+        )
+
+    def _clear_exit_failure_state(self, position) -> None:
+        self._state.setdefault("exit_failures", {}).pop(self._position_key(position), None)
+        self._save_state()
+
+    def _wallet_mismatch_key(self, chain: str, token: str) -> str:
+        return f"{str(chain).lower()}:{token}"
+
+    def get_wallet_mismatch(self, chain: str, token: str) -> Optional[dict]:
+        return self._state.setdefault("wallet_mismatches", {}).get(self._wallet_mismatch_key(chain, token))
+
+    def set_wallet_mismatch(self, chain: str, token: str, payload: dict) -> None:
+        payload = dict(payload or {})
+        payload.setdefault("detected_at", iso_utc_now())
+        self._state.setdefault("wallet_mismatches", {})[self._wallet_mismatch_key(chain, token)] = payload
+        self._save_state()
+
+    def clear_wallet_mismatch(self, chain: str, token: str) -> None:
+        key = self._wallet_mismatch_key(chain, token)
+        if self._state.setdefault("wallet_mismatches", {}).pop(key, None) is not None:
+            self._save_state()
+
+    def _next_exit_slippage_pct(self, chain: str, failure_count: int) -> float:
+        base = 2.0 if chain == "bsc" else 2.5
+        if failure_count >= 2:
+            return base + 10.0
+        if failure_count >= 1:
+            return base + 5.0
+        return base
+
+    def build_market_snapshot(self, position) -> Optional[dict]:
+        if self.mode != "live":
+            return None
+
+        chain = str(position.chain).lower()
+        token = position.contract_address
+        amount_token = self._estimate_token_amount(position)
+        if not token or amount_token <= 0:
+            return None
+
+        try:
+            if chain == "bsc":
+                from .dex_pancakeswap import PancakeSwap
+
+                usd_out = PancakeSwap(self._get_live_wallet(chain)).quote_sell(token, amount_token)
+            elif chain == "solana":
+                from .dex_jupiter import Jupiter
+
+                quote = Jupiter(self._get_live_wallet(chain)).quote_sell_to_usdc(token, amount_token)
+                usd_out = int(quote["outAmount"]) / 10**6
+            else:
+                return None
+        except Exception as exc:
+            log.warning("fallback quote failed for [%s] %s: %s", position.chain, position.symbol, exc)
+            return None
+
+        if usd_out <= 0:
+            return None
+
+        price_usd = usd_out / amount_token if amount_token > 0 else float(position.current_price)
+        return {
+            "symbol": position.symbol,
+            "contract_address": token,
+            "price_usd": price_usd,
+            "liquidity_usd": float(getattr(position, "current_liquidity", 0.0) or 0.0),
+            "holders_binance": int(getattr(position, "current_b_holders", 0) or 0),
+            "timestamp": iso_utc_now(),
+            "_fallback_disappearance": True,
+        }
 
     def submit_entry_signal(self, signal: dict):
         amount_usd = float(signal.get("position_size_usd", 0.0))
         chain = signal.get("chain", "?")
         signal_key = self._signal_key(signal)
 
+        if self._at_open_position_limit():
+            return {"status": "blocked", "reason": "max_open_positions"}
         if self._open_position_exists(signal):
             return {"status": "duplicate_open", "signal_key": signal_key}
         if signal_key in self._state["pending_entries"]:
             return {"status": "already_pending", "signal_key": signal_key}
+        cooldown = self._active_stop_loss_cooldown(signal)
+        if cooldown:
+            return {"status": "blocked", "reason": "stop_loss_cooldown", "cooldown_remaining_sec": cooldown.get("remaining_seconds", 0)}
+        reentry_cd = self._active_reentry_cooldown(signal)
+        if reentry_cd:
+            return {
+                "status": "blocked",
+                "reason": "reentry_cooldown",
+                "cooldown_remaining_sec": reentry_cd.get("remaining_seconds", 0),
+                "last_exit_reason": reentry_cd.get("exit_reason"),
+            }
+        mismatch = self.get_wallet_mismatch(chain, signal.get("contract_address"))
+        if mismatch:
+            log.warning("trade blocked by wallet/ledger mismatch: [%s] %s details=%s", chain, signal.get("symbol", "?"), mismatch)
+            return {"status": "blocked", "reason": "wallet_ledger_mismatch"}
         can_open, open_reason = self.position_manager.can_open(chain, signal.get("contract_address"))
         if not can_open:
-            log.warning("trade blocked by position manager: %s", open_reason)
+            # 중복 로그 제거: orchestrator가 호출 직후 "executor entry result: blocked reason=..." 형태로 동일 사건 기록
             return {"status": "blocked", "reason": open_reason}
 
         allowed, reason = self.safety.can_execute(chain, amount_usd)
@@ -92,16 +388,18 @@ class TradeExecutor:
                 "layer": honeypot_result.layer,
             }
 
-        signal_id = self.notifier.send_entry_signal(signal)
-        if not self.notifier.last_send_ok:
-            self.notifier.mark_decision(signal_id, "send_failed")
-            return {"status": "failed", "reason": "send_failed", "signal_id": signal_id}
+        approval_timeout = int(signal.get("approval_timeout", 300))
+        signal["approval_timeout"] = approval_timeout
+        # 시그널 단계 알림 제거 — 체결 확정 후 send_entry_notification에서만 1회 발사
+        # auto_approve_on_timeout=True 가정. 수동 승인 모드 재도입 시 분기 복구 필요.
+        signal_id = self.notifier.create_pending_approval(signal, auto_entry=True)
 
         self._state["pending_entries"][signal_key] = {
             "signal_id": signal_id,
             "queued_at": iso_utc_now(),
-            "approval_timeout": int(signal.get("approval_timeout", 300)),
+            "approval_timeout": approval_timeout,
             "signal": signal,
+            "notification_sent": False,
         }
         self._save_state()
         return {"status": "queued", "signal_id": signal_id, "signal_key": signal_key}
@@ -144,9 +442,38 @@ class TradeExecutor:
                 self._finalize_pending(signal_key)
                 results.append({"status": "duplicate_open", "signal_id": signal_id, "signal_key": signal_key})
                 continue
+            if self._at_open_position_limit():
+                log.info("entry skipped (no notification sent): %s reason=%s", signal.get("symbol", "?"), "max_open_positions")
+                self._finalize_pending(signal_key)
+                results.append({"status": "blocked", "reason": "max_open_positions", "signal_id": signal_id, "signal_key": signal_key})
+                continue
+            cooldown = self._active_stop_loss_cooldown(signal)
+            if cooldown:
+                log.info("entry skipped (no notification sent): %s reason=%s", signal.get("symbol", "?"), "stop_loss_cooldown")
+                self._finalize_pending(signal_key)
+                results.append({"status": "blocked", "reason": "stop_loss_cooldown", "signal_id": signal_id, "signal_key": signal_key})
+                continue
+            reentry_cd = self._active_reentry_cooldown(signal)
+            if reentry_cd:
+                log.info("entry skipped (no notification sent): %s reason=%s", signal.get("symbol", "?"), "reentry_cooldown")
+                self._finalize_pending(signal_key)
+                results.append({
+                    "status": "blocked",
+                    "reason": "reentry_cooldown",
+                    "signal_id": signal_id,
+                    "signal_key": signal_key,
+                })
+                continue
             chain = signal.get("chain", "?")
+            mismatch = self.get_wallet_mismatch(chain, signal.get("contract_address"))
+            if mismatch:
+                log.info("entry skipped (no notification sent): %s reason=%s", signal.get("symbol", "?"), "wallet_ledger_mismatch")
+                self._finalize_pending(signal_key)
+                results.append({"status": "blocked", "reason": "wallet_ledger_mismatch", "signal_id": signal_id, "signal_key": signal_key})
+                continue
             can_open, open_reason = self.position_manager.can_open(chain, signal.get("contract_address"))
             if not can_open:
+                log.info("entry skipped (no notification sent): %s reason=%s", signal.get("symbol", "?"), open_reason)
                 self._finalize_pending(signal_key)
                 results.append({"status": "blocked", "reason": open_reason, "signal_id": signal_id, "signal_key": signal_key})
                 continue
@@ -155,6 +482,7 @@ class TradeExecutor:
             allowed, reason = self.safety.can_execute(chain, amount_usd)
             if not allowed:
                 log.warning("trade blocked by safety at execution time: %s", reason)
+                log.info("entry skipped (no notification sent): %s reason=%s", signal.get("symbol", "?"), reason)
                 self._finalize_pending(signal_key)
                 results.append({"status": "blocked", "reason": reason, "signal_id": signal_id, "signal_key": signal_key})
                 continue
@@ -166,13 +494,19 @@ class TradeExecutor:
                 continue
 
             cfg = self.position_manager.chain_configs[chain]
-            if cfg.capital_per_position_pct <= 0:
-                self._finalize_pending(signal_key)
-                results.append({"status": "failed", "reason": "invalid_chain_position_pct", "signal_id": signal_id, "signal_key": signal_key})
-                continue
-
             signal_for_position = self._signal_with_execution_fill(signal, buy_result)
-            effective_total_capital_usd = amount_usd / (cfg.capital_per_position_pct / 100.0)
+            env_capital = os.getenv("TOTAL_CAPITAL_USD")
+            if env_capital:
+                try:
+                    effective_total_capital_usd = float(env_capital)
+                except ValueError:
+                    effective_total_capital_usd = amount_usd / (cfg.capital_per_position_pct / 100.0)
+            else:
+                if cfg.capital_per_position_pct <= 0:
+                    self._finalize_pending(signal_key)
+                    results.append({"status": "failed", "reason": "invalid_chain_position_pct", "signal_id": signal_id, "signal_key": signal_key})
+                    continue
+                effective_total_capital_usd = amount_usd / (cfg.capital_per_position_pct / 100.0)
             position = self.position_manager.open_position(
                 chain,
                 signal_for_position,
@@ -183,6 +517,10 @@ class TradeExecutor:
                 results.append({"status": "failed", "reason": "position_manager_rejected", "signal_id": signal_id, "signal_key": signal_key})
                 continue
 
+            if not item.get("notification_sent"):
+                sent = self.notifier.send_entry_notification(signal_for_position)
+                if not sent:
+                    log.warning("post-execution entry notification failed: %s", signal.get("symbol", "?"))
             self.safety.record_trade_executed(mode_at_execute=self.mode)
             self._finalize_pending(signal_key)
             results.append(
@@ -251,9 +589,42 @@ class TradeExecutor:
         )
 
     def handle_exit_signal(self, position, reason):
+        failure_state = self._get_exit_failure_state(position)
+        last_attempt_at = failure_state.get("last_attempt_at")
+        if last_attempt_at:
+            try:
+                elapsed = (utc_now() - parse_iso_utc(last_attempt_at)).total_seconds()
+            except Exception:
+                elapsed = 9999
+            if elapsed < 30:
+                return {
+                    "status": "retry_wait",
+                    "reason": f"retry_backoff_{30-int(elapsed)}s",
+                    "attempts": int(failure_state.get("count", 0)),
+                }
+
         sell_result = self._execute_sell(position)
         if not sell_result["ok"]:
-            return {"status": "failed", "reason": sell_result["reason"]}
+            failure_state["count"] = int(failure_state.get("count", 0)) + 1
+            failure_state["last_attempt_at"] = iso_utc_now()
+            failure_state["last_error"] = sell_result["reason"]
+            attempts = failure_state["count"]
+            log.warning(
+                "exit failed: [%s] %s reason=%s attempts=%s",
+                position.chain,
+                position.symbol,
+                sell_result["reason"],
+                attempts,
+            )
+            if attempts >= 5 and not failure_state.get("notified_manual"):
+                failure_state["notified_manual"] = True
+                self.notifier.send_emergency(
+                    f"Manual exit needed: {position.symbol} [{position.chain.upper()}]\n"
+                    f"Reason: {sell_result['reason']}\n"
+                    f"Attempts: {attempts}"
+                )
+            self._save_state()
+            return {"status": "failed", "reason": sell_result["reason"], "attempts": attempts}
 
         pnl_usd = float(sell_result.get("amount_out_usd", 0.0)) - float(position.size_usd)
         pnl_pct = (pnl_usd / float(position.size_usd)) * 100.0 if position.size_usd else 0.0
@@ -267,7 +638,20 @@ class TradeExecutor:
             realized_pnl_usd=pnl_usd,
             exit_tx_hash=sell_result.get("tx_hash"),
         )
+        reason_value = getattr(reason, "value", str(reason))
+        if reason_value == "STOP_LOSS":
+            self._state.setdefault("stop_loss_cooldowns", {})[self._position_key(position)] = {
+                "last_stop_at": iso_utc_now(),
+                "symbol": position.symbol,
+            }
+        self._state.setdefault("reentry_cooldowns", {})[self._position_key(position)] = {
+            "last_exit_at": iso_utc_now(),
+            "symbol": position.symbol,
+            "exit_reason": reason_value,
+        }
+        self._save_state()
         self.notifier.send_exit_notification(closed, reason.value, pnl_pct, pnl_usd)
+        self._clear_exit_failure_state(position)
         return {"status": "closed", "position": closed, "tx_hash": sell_result.get("tx_hash")}
 
     def _execute_buy(self, signal: dict) -> dict:
@@ -333,32 +717,72 @@ class TradeExecutor:
     def _sell_live(self, position) -> dict:
         chain = str(position.chain).lower()
         token = position.contract_address
-        amount_token = float(getattr(position, "token_amount", 0.0) or 0.0)
+        estimated_amount = self._estimate_token_amount(position)
+        wallet_balance = self._get_wallet_token_balance(chain, token)
+        amount_token = wallet_balance if wallet_balance > 0 else estimated_amount
+        failure_count = int(self._get_exit_failure_state(position).get("count", 0))
         if not token:
             return {"ok": False, "reason": "missing_contract_address"}
         if amount_token <= 0:
             return {"ok": False, "reason": "missing_token_amount_for_live_sell"}
+        if wallet_balance > 0 and estimated_amount > 0 and wallet_balance < estimated_amount:
+            log.warning(
+                "sell amount adjusted to wallet balance: [%s] %s estimated=%.9f actual=%.9f",
+                chain,
+                position.symbol,
+                estimated_amount,
+                wallet_balance,
+            )
 
         try:
             if chain == "bsc":
                 from .dex_pancakeswap import PancakeSwap
 
-                result = PancakeSwap(self._get_live_wallet(chain)).sell(token, amount_token, slippage_pct=2.0)
-                if not result.success:
-                    return {"ok": False, "reason": result.error or "bsc_sell_failed", "tx_hash": result.tx_hash}
-                exit_price = (float(result.amount_out or 0.0) / amount_token) if amount_token > 0 else None
-                return {
-                    "ok": True,
-                    "tx_hash": result.tx_hash,
-                    "amount_out_usd": float(result.amount_out or 0.0),
-                    "exit_price": exit_price,
-                    "timestamp": iso_utc_now(),
-                }
+                wallet = self._get_live_wallet(chain)
+                dex = PancakeSwap(wallet)
+                slippage_pct = self._next_exit_slippage_pct(chain, failure_count)
+                fractions = [0.995, 0.98, 0.95, 0.90] if wallet_balance > 0 else [1.0]
+                last_failure = None
+                token_decimals = dex.get_token_info(token)["decimals"]
+                quantum = 10 ** token_decimals
+
+                for fraction in fractions:
+                    sell_amount = amount_token * fraction
+                    sell_amount = int(sell_amount * quantum) / quantum
+                    if sell_amount <= 0:
+                        continue
+                    if fraction < 1.0:
+                        log.warning(
+                            "partial sell retry: [%s] %s fraction=%.3f amount=%.9f",
+                            chain,
+                            position.symbol,
+                            fraction,
+                            sell_amount,
+                        )
+                    result = dex.sell(token, sell_amount, slippage_pct=slippage_pct)
+                    if result.success:
+                        exit_price = (float(result.amount_out or 0.0) / sell_amount) if sell_amount > 0 else None
+                        return {
+                            "ok": True,
+                            "tx_hash": result.tx_hash,
+                            "amount_out_usd": float(result.amount_out or 0.0),
+                            "exit_price": exit_price,
+                            "timestamp": iso_utc_now(),
+                        }
+                    last_failure = result
+                    error_text = str(result.error or "")
+                    if "TRANSFER_FROM_FAILED" not in error_text:
+                        return {"ok": False, "reason": result.error or "bsc_sell_failed", "tx_hash": result.tx_hash}
+
+                if last_failure is not None:
+                    return {"ok": False, "reason": last_failure.error or "bsc_sell_failed", "tx_hash": last_failure.tx_hash}
+                return {"ok": False, "reason": "bsc_sell_failed_no_attempt"}
 
             if chain == "solana":
                 from .dex_jupiter import Jupiter
 
-                result = Jupiter(self._get_live_wallet(chain)).sell(token, amount_token, slippage_pct=2.5)
+                slippage_pct = self._next_exit_slippage_pct(chain, failure_count)
+                result = Jupiter(self._get_live_wallet(chain)).sell(token, amount_token, slippage_pct=slippage_pct)
                 if not result.success:
                     return {"ok": False, "reason": result.error or "solana_sell_failed", "tx_hash": result.tx_signature}
                 exit_price = (float(result.amount_out or 0.0) / amount_token) if amount_token > 0 else None
@@ -375,24 +799,44 @@ class TradeExecutor:
         return {"ok": False, "reason": f"unsupported_chain:{chain}"}
 
     def _simulate_buy(self, signal: dict) -> dict:
+        amount_in_usd = float(signal.get("position_size_usd", 0.0) or 0.0)
+        price_usd = float(signal.get("price_usd", 0.0) or 0.0)
+        amount_out_token = (amount_in_usd / price_usd) if price_usd > 0 else 0.0
         log.info(
             "dry_run simulated buy: [%s] %s @ $%.6f size=$%.2f",
             signal.get("chain", "?"),
             signal.get("symbol", "?"),
-            float(signal.get("price_usd", 0.0)),
-            float(signal.get("position_size_usd", 0.0)),
+            price_usd,
+            amount_in_usd,
         )
-        return {"ok": True, "timestamp": iso_utc_now()}
+        return {
+            "ok": True,
+            "timestamp": iso_utc_now(),
+            "amount_out_token": amount_out_token,
+            "tx_hash": "dry_run_buy",
+        }
 
     def _simulate_sell(self, position) -> dict:
+        token_amount = float(getattr(position, "token_amount", 0.0) or 0.0)
+        current_price = float(getattr(position, "current_price", 0.0) or 0.0)
+        size_usd = float(getattr(position, "size_usd", 0.0) or 0.0)
+        amount_out_usd = token_amount * current_price if token_amount > 0 and current_price > 0 else (
+            size_usd * (1.0 + float(position.unrealized_pnl_pct) / 100.0)
+        )
         log.info(
             "dry_run simulated sell: [%s] %s @ $%.6f pnl=%+.2f%%",
             position.chain,
             position.symbol,
-            float(position.current_price),
+            current_price,
             float(position.unrealized_pnl_pct),
         )
-        return {"ok": True, "timestamp": iso_utc_now()}
+        return {
+            "ok": True,
+            "timestamp": iso_utc_now(),
+            "amount_out_usd": amount_out_usd,
+            "exit_price": current_price if current_price > 0 else None,
+            "tx_hash": "dry_run_sell",
+        }
 
     def emergency_close_all(self):
         closed = 0
