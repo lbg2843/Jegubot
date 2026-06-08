@@ -29,6 +29,27 @@ class EthMacroSnapshot:
     source: str = 'binance'
 
 
+# ETH 4h 변동률 레짐 밴드. 경계는 btc_correlation 분석 버킷과 동일하게 유지해야
+# 진입시점 태깅과 사후 상관분석이 1:1로 맞물린다. (lo <= x < hi)
+ETH_4H_REGIME_BANDS = (
+    ('strong_down', float('-inf'), -2.0),
+    ('down',        -2.0,          -0.5),
+    ('flat',        -0.5,           0.5),
+    ('up',           0.5,           2.0),
+    ('strong_up',    2.0,  float('inf')),
+)
+
+
+def classify_eth_4h_regime(change_4h_pct: Optional[float]) -> str:
+    """ETH 4h 변동률을 레짐 밴드명으로 분류. None이면 'unknown'."""
+    if change_4h_pct is None:
+        return 'unknown'
+    for name, lo, hi in ETH_4H_REGIME_BANDS:
+        if lo <= change_4h_pct < hi:
+            return name
+    return 'unknown'
+
+
 class EthMacroFilter:
     def __init__(self) -> None:
         self._snapshot: Optional[EthMacroSnapshot] = None
@@ -77,6 +98,12 @@ class EthMacroFilter:
             if self._snapshot and (now_mono - self._fetched_monotonic) < self._stale_ok_seconds:
                 return self._snapshot
             return EthMacroSnapshot(None, None, None, None, source='unavailable')
+
+    def current_regime(self) -> tuple[Optional[float], str]:
+        """진입시점 ETH 4h 변동률과 레짐 밴드명. 게이트가 이미 받아둔 캐시
+        스냅샷을 재사용하므로 추가 네트워크 호출이 없다(미가용 시 (None,'unknown'))."""
+        snap = self.get_snapshot()
+        return snap.change_4h_pct, classify_eth_4h_regime(snap.change_4h_pct)
 
     def should_block_entry(self) -> tuple[bool, str]:
         if not self.enabled:

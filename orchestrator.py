@@ -1276,6 +1276,11 @@ class Orchestrator:
                     continue
                 if self.executor and chain_max_signals > 0 and submitted_signals >= chain_max_signals:
                     break
+                # 진입시점 ETH 4h 레짐 태깅 (분석 전용). 게이트가 이미 받아둔 캐시
+                # 스냅샷 재사용 → 추가 네트워크 호출 없음. 사후 상관분석에서 "완만한
+                # 상승(up)" 레짐 거래만 따로 묶어 재검증하기 위함.
+                eth_change_4h, eth_regime = get_eth_macro_filter().current_regime()
+                eth_extra = {"eth_4h_pct": eth_change_4h, "eth_4h_regime": eth_regime}
                 if self.executor:
                     signal = self._build_trade_signal(cand, chain)
                     result = self.executor.submit_entry_signal(signal)
@@ -1286,7 +1291,7 @@ class Orchestrator:
                         log_entry_snapshot(
                             cand, chain,
                             mode=("dry" if self.dry_run else "live"),
-                            extra={"executor_status": result.get("status"), "signal_id": result.get("signal_id")},
+                            extra={"executor_status": result.get("status"), "signal_id": result.get("signal_id"), **eth_extra},
                         )
                     continue
                 if not self.dry_run:
@@ -1297,9 +1302,9 @@ class Orchestrator:
                     if pos:
                         submitted_signals += 1
                         self._notify_entry(cand, pos)
-                        log_entry_snapshot(cand, chain, mode="live")   # ← 추가
+                        log_entry_snapshot(cand, chain, mode="live", extra=eth_extra)   # ← 추가
                 else:
-                    log_entry_snapshot(cand, chain, mode="dry")        # ← 추가
+                    log_entry_snapshot(cand, chain, mode="dry", extra=eth_extra)        # ← 추가
                     log.info(
                         f"[DRY-RUN] entry preview: [{chain.upper()}] {cand['symbol']} "
                         f"price=${cand.get('price_usd', 0):.6f} "
