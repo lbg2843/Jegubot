@@ -297,14 +297,43 @@ class TradeExecutor:
             return base + 5.0
         return base
 
-    def build_market_snapshot(self, position) -> Optional[dict]:
-        if self.mode != "live":
-            return None
+    def _fallback_snapshot(self, position, price_usd: float) -> dict:
+        return {
+            "symbol": position.symbol,
+            "contract_address": position.contract_address,
+            "price_usd": price_usd,
+            "liquidity_usd": float(getattr(position, "current_liquidity", 0.0) or 0.0),
+            "holders_binance": int(getattr(position, "current_b_holders", 0) or 0),
+            "timestamp": iso_utc_now(),
+            "_fallback_disappearance": True,
+        }
 
+    def build_market_snapshot(self, position) -> Optional[dict]:
         chain = str(position.chain).lower()
         token = position.contract_address
+        if not token:
+            return None
+
+        # base: 라이브 DEX 호가 경로가 없어 포지션이 trending 피드에서 빠지면 가격이
+        # 동결되던 문제(PITCH/BNKR 수십 시간 방치) → 지갑 불필요한 GeckoTerminal
+        # 컨트랙트 가격으로 재호가. dry_run 포함 모든 모드에서 동작한다.
+        if chain == "base":
+            try:
+                from gecko_client import fetch_token_price
+
+                price_usd = fetch_token_price(chain, token)
+            except Exception as exc:
+                log.warning("base fallback price failed for %s: %s", position.symbol, exc)
+                return None
+            if not price_usd or price_usd <= 0:
+                return None
+            return self._fallback_snapshot(position, price_usd)
+
+        # bsc/solana: 실제 매도 호가 기반(체결 정확도 우선, 지갑 필요 → live 전용).
+        if self.mode != "live":
+            return None
         amount_token = self._estimate_token_amount(position)
-        if not token or amount_token <= 0:
+        if amount_token <= 0:
             return None
 
         try:
@@ -327,15 +356,7 @@ class TradeExecutor:
             return None
 
         price_usd = usd_out / amount_token if amount_token > 0 else float(position.current_price)
-        return {
-            "symbol": position.symbol,
-            "contract_address": token,
-            "price_usd": price_usd,
-            "liquidity_usd": float(getattr(position, "current_liquidity", 0.0) or 0.0),
-            "holders_binance": int(getattr(position, "current_b_holders", 0) or 0),
-            "timestamp": iso_utc_now(),
-            "_fallback_disappearance": True,
-        }
+        return self._fallback_snapshot(position, price_usd)
 
     def submit_entry_signal(self, signal: dict):
         amount_usd = float(signal.get("position_size_usd", 0.0))

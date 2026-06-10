@@ -80,6 +80,40 @@ class TrendingToken:
         return self.holders_binance / max(self.holders_total, 1)
 
 
+def fetch_token_price(chain: str, contract_address: str) -> Optional[float]:
+    """단일 토큰의 현재 USD 가격을 컨트랙트 주소로 조회.
+
+    trending_pools 피드에서 사라진 보유 포지션을 재호가하기 위한 폴백 소스.
+    지갑/체결 없이 동작하므로 dry_run·live 모두에서 쓸 수 있다.
+    (simple/token_price 엔드포인트, 키 불필요, 최대 30개 주소까지 지원하나 여기선 1개)
+
+    Returns:
+        가격(float) 또는 조회 실패 시 None.
+    """
+    network = CHAIN_TO_NETWORK.get(chain)
+    if not network or not contract_address:
+        return None
+    url = f"{API_BASE}/simple/networks/{network}/token_price/{contract_address}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        prices = (
+            resp.json()
+            .get("data", {})
+            .get("attributes", {})
+            .get("token_prices", {})
+        )
+        # 주소 키는 대소문자가 응답마다 다를 수 있어 대소문자 무시 매칭.
+        target = contract_address.lower()
+        for addr, price in prices.items():
+            if addr.lower() == target:
+                value = float(price) if price not in (None, "") else 0.0
+                return value if value > 0 else None
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        log.warning(f"fetch_token_price 실패 [{chain}] {contract_address[:12]}: {exc}")
+    return None
+
+
 def fetch_trending_pools(chain: str, page: int = 1, limit: int = 20) -> list[TrendingToken]:
     """
     GeckoTerminal trending_pools 엔드포인트 호출.
