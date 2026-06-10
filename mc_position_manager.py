@@ -23,7 +23,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from trading.time_utils import iso_utc_now, parse_iso_utc
+from trading.time_utils import iso_utc_now, parse_iso_utc, utc_now
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -223,12 +223,16 @@ class Position:
 
     @property
     def hold_hours(self) -> float:
-        if not self.entry_timestamp or not self.last_update:
+        # 보유시간은 '지금' 기준으로 잰다. 과거엔 last_update 기준이었는데,
+        # last_update 는 스냅샷이 매칭될 때만 갱신되므로(update_all 의 snap 경로),
+        # base 처럼 fallback 호가가 없는 체인에서 포지션이 시세 피드를 잃으면
+        # last_update 가 멈춰 hold_hours 가 동결 → max_hold TIME_EXIT 안전망이
+        # 영원히 발동 못 하던 버그(PITCH 40.7h / BNKR 51.8h 방치)를 유발했다.
+        if not self.entry_timestamp:
             return 0.0
         try:
             entry_dt = parse_iso_utc(self.entry_timestamp)
-            now_dt = parse_iso_utc(self.last_update)
-            return (now_dt - entry_dt).total_seconds() / 3600
+            return (utc_now() - entry_dt).total_seconds() / 3600
         except Exception:
             return 0.0
 
