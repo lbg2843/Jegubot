@@ -277,8 +277,14 @@ class ExitSignalEngine:
                 f"[{pos.chain}] early stop hit: {pnl:+.2f}% <= {self.early_stop_threshold_pct:+.0f}% within {held_minutes:.1f}m"
             )
 
+        # 만기를 이미 넘긴 포지션은 STOP_LOSS 가 아니라 TIME_EXIT 로 청산한다(아래 4번).
+        # 동결 등으로 max_hold 를 초과해 뒤늦게 평가될 때, 실제로는 시간 만기인 청산이
+        # STOP_LOSS 로 오라벨링되고 reentry 쿨다운(720min)도 과도하게 길어지던 문제 방지.
+        # (트레일링/익절 라벨은 그대로 우선 — 고점 후 하락은 TRAILING_STOP 이 더 정확)
+        overdue = pos.hold_hours >= cfg.max_hold_hours
+
         # 2. stop loss
-        if pnl <= cfg.stop_loss_pct:
+        if pnl <= cfg.stop_loss_pct and not overdue:
             return True, ExitReason.STOP_LOSS, (
                 f"[{pos.chain}] 스탑 발동: {pnl:+.2f}% ≤ {cfg.stop_loss_pct:+.0f}%"
             )
