@@ -28,10 +28,32 @@ SHADOW_RULES = {
         'enable_paths': ['sweet_spot', 'reflexivity'],
         'sweet_spot_max_15m_drop_pct': -3.0,
     },
+    # 실험(2026-06-11): btc_correlation 누적에서 ETH 4h "완만한 상승(up)" 레짐 진입이
+    # 반복적으로 최악(승 27%/평균 -3.9%)이었다. 그 레짐 진입을 차단하면 실제로 나아지는지
+    # shadow 로 검증. 거동 영향 없음, 차단 여부만 기록.
+    'shadow_e_block_eth_up': {
+        'description': 'block entries when ETH 4h regime == up',
+        'block_eth_regimes': ['up'],
+    },
+    'shadow_f_block_eth_up_strong': {
+        'description': 'block entries when ETH 4h regime in {up, strong_up}',
+        'block_eth_regimes': ['up', 'strong_up'],
+    },
 }
 
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'shadow_decisions.jsonl'
 DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _current_eth_4h_regime() -> str:
+    """진입시점 ETH 4h 레짐(게이트가 받아둔 캐시 스냅샷 재사용). 실패 시 'unknown'
+    → 어떤 block 리스트에도 안 들어가므로 안전하게 현 게이트와 동일 동작."""
+    try:
+        from eth_macro_filter import get_eth_macro_filter
+        _, regime = get_eth_macro_filter().current_regime()
+        return regime
+    except Exception:
+        return 'unknown'
 
 
 def evaluate_shadow(token_dict: dict, current_passes_safety_gate: Callable) -> dict:
@@ -39,6 +61,24 @@ def evaluate_shadow(token_dict: dict, current_passes_safety_gate: Callable) -> d
     for shadow_name, overrides in SHADOW_RULES.items():
         backup_vars = {}
         try:
+            if 'block_eth_regimes' in overrides:
+                # 현 게이트를 먼저 통과한 진입만 의미 있음. 통과 + 차단 레짐이면 would_block.
+                chain = token_dict.get('chain', 'base')
+                passed, reason = current_passes_safety_gate(token_dict, chain)
+                if passed:
+                    regime = _current_eth_4h_regime()
+                    if regime in overrides['block_eth_regimes']:
+                        results[shadow_name] = {
+                            'passed': False,
+                            'reason': f'eth_regime_blocked_{regime}',
+                        }
+                        continue
+                results[shadow_name] = {
+                    'passed': bool(passed),
+                    'reason': reason if not passed else 'passed',
+                }
+                continue
+
             if 'enable_paths' in overrides:
                 if token_dict.get('entry_path') not in overrides['enable_paths']:
                     results[shadow_name] = {
