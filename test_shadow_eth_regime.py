@@ -61,6 +61,27 @@ def test_unknown_regime_is_safe_passthrough(monkeypatch):
     assert res["shadow_f_block_eth_up_strong"]["passed"] is True
 
 
+def test_disable_sweet_spot_blocks_sweet_spot(monkeypatch):
+    _set_regime(monkeypatch, "flat")  # 레짐 무관, 경로만
+    sweet = dict(_tok(), entry_path="sweet_spot")
+    gz = dict(_tok(), entry_path="golden_zone")
+    res_sweet = shadow_rules.evaluate_shadow(sweet, _gate_pass)
+    res_gz = shadow_rules.evaluate_shadow(gz, _gate_pass)
+    assert res_sweet["shadow_g_disable_sweet_spot"]["passed"] is False
+    assert res_gz["shadow_g_disable_sweet_spot"]["passed"] is True
+
+
+def test_block_up_sweet_spot_combo(monkeypatch):
+    # up x sweet_spot 만 차단. up x golden_zone, flat x sweet_spot 는 통과.
+    _set_regime(monkeypatch, "up")
+    sweet = dict(_tok(), entry_path="sweet_spot")
+    gz = dict(_tok(), entry_path="golden_zone")
+    assert shadow_rules.evaluate_shadow(sweet, _gate_pass)["shadow_h_block_up_sweet_spot"]["passed"] is False
+    assert shadow_rules.evaluate_shadow(gz, _gate_pass)["shadow_h_block_up_sweet_spot"]["passed"] is True
+    _set_regime(monkeypatch, "flat")
+    assert shadow_rules.evaluate_shadow(sweet, _gate_pass)["shadow_h_block_up_sweet_spot"]["passed"] is True
+
+
 if __name__ == "__main__":
     class _MP:
         def __init__(self): self._u = []
@@ -70,7 +91,8 @@ if __name__ == "__main__":
             for o, n, v in reversed(self._u): setattr(o, n, v)
     for fn in (test_up_regime_blocks_e_and_f, test_flat_regime_blocks_neither,
                test_strong_up_blocks_only_f, test_gate_fail_is_not_relabeled_as_regime_block,
-               test_unknown_regime_is_safe_passthrough):
+               test_unknown_regime_is_safe_passthrough, test_disable_sweet_spot_blocks_sweet_spot,
+               test_block_up_sweet_spot_combo):
         mp = _MP()
         try:
             fn(mp)

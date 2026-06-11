@@ -39,6 +39,17 @@ SHADOW_RULES = {
         'description': 'block entries when ETH 4h regime in {up, strong_up}',
         'block_eth_regimes': ['up', 'strong_up'],
     },
+    # 실험: sweet_spot 경로 자체가 net-negative 인지 검증(현 진입 대부분이 sweet_spot).
+    'shadow_g_disable_sweet_spot': {
+        'description': 'sweet_spot path disabled',
+        'enable_paths': ['golden_zone', 'reflexivity'],
+    },
+    # 실험: "최악 레짐 x 주력 경로" 조합만 차단 — up 레짐의 sweet_spot 진입만.
+    'shadow_h_block_up_sweet_spot': {
+        'description': 'block sweet_spot entries when ETH 4h regime == up',
+        'block_eth_regimes': ['up'],
+        'block_paths': ['sweet_spot'],
+    },
 }
 
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'shadow_decisions.jsonl'
@@ -67,7 +78,9 @@ def evaluate_shadow(token_dict: dict, current_passes_safety_gate: Callable) -> d
                 passed, reason = current_passes_safety_gate(token_dict, chain)
                 if passed:
                     regime = _current_eth_4h_regime()
-                    if regime in overrides['block_eth_regimes']:
+                    block_paths = overrides.get('block_paths')  # None = 전 경로
+                    path_match = block_paths is None or token_dict.get('entry_path') in block_paths
+                    if regime in overrides['block_eth_regimes'] and path_match:
                         results[shadow_name] = {
                             'passed': False,
                             'reason': f'eth_regime_blocked_{regime}',
