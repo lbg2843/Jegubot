@@ -77,6 +77,7 @@ def load_entries(since):
             "symbol": r.get("symbol"), "entry_path": r.get("entry_path"),
             "pc_1h": _pc1h(r), "utc_hour": r.get("utc_hour"),
             "eth_4h_regime": r.get("eth_4h_regime"),
+            "final_score": r.get("final_score"),
         })
     return out
 
@@ -179,6 +180,13 @@ def arm_blocks(overrides, e):
         else:  # 자정 걸침 (예: 22-04)
             inside = h >= s or h < en
         return (not inside), True
+
+    if "block_if_score_below" in overrides:
+        sc = e.get("final_score")
+        chains = overrides.get("score_chains")
+        if not isinstance(sc, (int, float)) or (chains is not None and e.get("chain") not in chains):
+            return False, False  # 점수 미태깅/체인 불일치 → 평가 불가
+        return sc < overrides["block_if_score_below"], True
 
     return False, False
 

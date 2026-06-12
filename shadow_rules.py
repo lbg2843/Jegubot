@@ -65,6 +65,13 @@ SHADOW_RULES = {
         'description': 'allow only 6-12 UTC entries',
         'allow_utc_hours': [6, 12],
     },
+    # 실험(2026-06-12): score_outcomes(base) 검증 — golden zone [0.15,0.25) 는 +54%/80%승으로
+    # 유효하나 그 아래 <.15 는 junk(median -15%/31%승). 골든존 하한 미만만 차단.
+    'shadow_l_score_below_floor': {
+        'description': 'block base entries with final_score < 0.15 (golden zone 하한 미만)',
+        'block_if_score_below': 0.15,
+        'score_chains': ['base'],
+    },
 }
 
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'shadow_decisions.jsonl'
@@ -83,7 +90,8 @@ def _current_eth_4h_regime() -> str:
 
 
 # 게이트 통과 후 진입 피처로 거르는 실험 키들(파라미터 override 가 아님).
-_POST_GATE_KEYS = ('block_eth_regimes', 'block_if_pc1h_above', 'allow_pc1h_range', 'allow_utc_hours')
+_POST_GATE_KEYS = ('block_eth_regimes', 'block_if_pc1h_above', 'allow_pc1h_range', 'allow_utc_hours',
+                   'block_if_score_below')
 
 
 def _pc_1h(token_dict: dict):
@@ -119,6 +127,14 @@ def _post_gate_block_reason(token_dict: dict, overrides: dict):
         hour = datetime.now(timezone.utc).hour
         if not (start <= hour < end):
             return f'utc_hour_{hour}_out_of_[{start},{end})'
+
+    if 'block_if_score_below' in overrides:
+        sc = token_dict.get('final_score')
+        chains = overrides.get('score_chains')
+        if isinstance(sc, (int, float)) and (chains is None or token_dict.get('chain') in chains):
+            thr = overrides['block_if_score_below']
+            if sc < thr:
+                return f'score_below_{thr}({sc:.3f})'
     return None
 
 

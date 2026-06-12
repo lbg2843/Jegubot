@@ -119,6 +119,18 @@ def test_hours_6_12(monkeypatch):
     assert shadow_rules.evaluate_shadow(_tok(), _gate_pass)["shadow_k_hours_6_12"]["passed"] is False
 
 
+def test_score_below_floor(monkeypatch):
+    junk = dict(_tok(), chain="base", final_score=0.10)
+    golden = dict(_tok(), chain="base", final_score=0.20)
+    bsc = dict(_tok(), chain="bsc", final_score=0.10)   # score_chains=base 만
+    missing = dict(_tok(), chain="base")                 # final_score 없음 → 패스스루
+    R = "shadow_l_score_below_floor"
+    assert shadow_rules.evaluate_shadow(junk, _gate_pass)[R]["passed"] is False
+    assert shadow_rules.evaluate_shadow(golden, _gate_pass)[R]["passed"] is True
+    assert shadow_rules.evaluate_shadow(bsc, _gate_pass)[R]["passed"] is True
+    assert shadow_rules.evaluate_shadow(missing, _gate_pass)[R]["passed"] is True
+
+
 if __name__ == "__main__":
     class _MP:
         def __init__(self): self._u = []
@@ -130,7 +142,7 @@ if __name__ == "__main__":
                test_strong_up_blocks_only_f, test_gate_fail_is_not_relabeled_as_regime_block,
                test_unknown_regime_is_safe_passthrough, test_disable_sweet_spot_blocks_sweet_spot,
                test_block_up_sweet_spot_combo, test_block_pump_chase, test_pullback_only_range,
-               test_pc1h_missing_is_safe_passthrough, test_hours_6_12):
+               test_pc1h_missing_is_safe_passthrough, test_hours_6_12, test_score_below_floor):
         mp = _MP()
         try:
             fn(mp)
