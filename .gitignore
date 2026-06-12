@@ -74,6 +74,7 @@ sweet_traj.py
 /run_forever_test2.txt
 /trailing_compare.txt
 /*handoff*.md
+/*discussion*.md
 /candidate_sample.json
 /closed_positions.jsonl
 /score_outcomes_sample.jsonl
