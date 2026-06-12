@@ -50,6 +50,21 @@ SHADOW_RULES = {
         'block_eth_regimes': ['up'],
         'block_paths': ['sweet_spot'],
     },
+    # 실험(2026-06-12): 진입 미시구조 신호. discriminator 스캔에서 매크로보다
+    # pc_1h(진입 1h 모멘텀)/시간대가 승패를 더 잘 갈랐다.
+    # 급등 추격(pc_1h>15%)은 0% 승/-17%, 양극단 회피·눌림(-2~+5%)이 우세, 6-12 UTC 가 +.
+    'shadow_i_block_pump_chase': {
+        'description': 'block entries with pc_1h > +15% (FOMO 추격 컷)',
+        'block_if_pc1h_above': 15.0,
+    },
+    'shadow_j_pullback_only': {
+        'description': 'allow only pc_1h in [-2%, +5%] (눌림~완만 구간만)',
+        'allow_pc1h_range': [-2.0, 5.0],
+    },
+    'shadow_k_hours_6_12': {
+        'description': 'allow only 6-12 UTC entries',
+        'allow_utc_hours': [6, 12],
+    },
 }
 
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'shadow_decisions.jsonl'
@@ -67,29 +82,63 @@ def _current_eth_4h_regime() -> str:
         return 'unknown'
 
 
+# 게이트 통과 후 진입 피처로 거르는 실험 키들(파라미터 override 가 아님).
+_POST_GATE_KEYS = ('block_eth_regimes', 'block_if_pc1h_above', 'allow_pc1h_range', 'allow_utc_hours')
+
+
+def _pc_1h(token_dict: dict):
+    for k in ('price_change_1h_pct', 'price_change_1h', 'pc_1h'):
+        v = token_dict.get(k)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return None
+
+
+def _post_gate_block_reason(token_dict: dict, overrides: dict):
+    """게이트 통과한 진입에 대해 실험 피처 필터를 적용. 차단 사유 문자열 또는 None.
+    값이 없으면(예: pc_1h 누락) 해당 필터는 건너뛴다(안전 패스스루)."""
+    if 'block_eth_regimes' in overrides:
+        regime = _current_eth_4h_regime()
+        block_paths = overrides.get('block_paths')  # None = 전 경로
+        path_match = block_paths is None or token_dict.get('entry_path') in block_paths
+        if regime in overrides['block_eth_regimes'] and path_match:
+            return f'eth_regime_blocked_{regime}'
+
+    pc1h = _pc_1h(token_dict)
+    if 'block_if_pc1h_above' in overrides and pc1h is not None:
+        thr = overrides['block_if_pc1h_above']
+        if pc1h > thr:
+            return f'pc1h_above_{thr}({pc1h:+.2f})'
+    if 'allow_pc1h_range' in overrides and pc1h is not None:
+        lo, hi = overrides['allow_pc1h_range']
+        if not (lo <= pc1h <= hi):
+            return f'pc1h_out_of_[{lo},{hi}]({pc1h:+.2f})'
+
+    if 'allow_utc_hours' in overrides:
+        start, end = overrides['allow_utc_hours']
+        hour = datetime.now(timezone.utc).hour
+        if not (start <= hour < end):
+            return f'utc_hour_{hour}_out_of_[{start},{end})'
+    return None
+
+
 def evaluate_shadow(token_dict: dict, current_passes_safety_gate: Callable) -> dict:
     results = {}
     for shadow_name, overrides in SHADOW_RULES.items():
         backup_vars = {}
         try:
-            if 'block_eth_regimes' in overrides:
-                # 현 게이트를 먼저 통과한 진입만 의미 있음. 통과 + 차단 레짐이면 would_block.
+            if any(k in overrides for k in _POST_GATE_KEYS):
+                # 현 게이트를 먼저 통과한 진입만 의미 있음. 통과 + 실험 필터 차단이면 would_block.
                 chain = token_dict.get('chain', 'base')
                 passed, reason = current_passes_safety_gate(token_dict, chain)
-                if passed:
-                    regime = _current_eth_4h_regime()
-                    block_paths = overrides.get('block_paths')  # None = 전 경로
-                    path_match = block_paths is None or token_dict.get('entry_path') in block_paths
-                    if regime in overrides['block_eth_regimes'] and path_match:
-                        results[shadow_name] = {
-                            'passed': False,
-                            'reason': f'eth_regime_blocked_{regime}',
-                        }
-                        continue
-                results[shadow_name] = {
-                    'passed': bool(passed),
-                    'reason': reason if not passed else 'passed',
-                }
+                if not passed:
+                    results[shadow_name] = {'passed': False, 'reason': reason}
+                    continue
+                block_reason = _post_gate_block_reason(token_dict, overrides)
+                results[shadow_name] = (
+                    {'passed': False, 'reason': block_reason} if block_reason
+                    else {'passed': True, 'reason': 'passed'}
+                )
                 continue
 
             if 'enable_paths' in overrides:

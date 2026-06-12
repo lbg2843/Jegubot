@@ -82,6 +82,43 @@ def test_block_up_sweet_spot_combo(monkeypatch):
     assert shadow_rules.evaluate_shadow(sweet, _gate_pass)["shadow_h_block_up_sweet_spot"]["passed"] is True
 
 
+def test_block_pump_chase(monkeypatch):
+    hi = dict(_tok(), price_change_1h_pct=20.0)
+    ok = dict(_tok(), price_change_1h_pct=10.0)
+    assert shadow_rules.evaluate_shadow(hi, _gate_pass)["shadow_i_block_pump_chase"]["passed"] is False
+    assert shadow_rules.evaluate_shadow(ok, _gate_pass)["shadow_i_block_pump_chase"]["passed"] is True
+
+
+def test_pullback_only_range(monkeypatch):
+    inr = dict(_tok(), price_change_1h_pct=3.0)
+    above = dict(_tok(), price_change_1h_pct=10.0)
+    below = dict(_tok(), price_change_1h_pct=-5.0)
+    assert shadow_rules.evaluate_shadow(inr, _gate_pass)["shadow_j_pullback_only"]["passed"] is True
+    assert shadow_rules.evaluate_shadow(above, _gate_pass)["shadow_j_pullback_only"]["passed"] is False
+    assert shadow_rules.evaluate_shadow(below, _gate_pass)["shadow_j_pullback_only"]["passed"] is False
+
+
+def test_pc1h_missing_is_safe_passthrough(monkeypatch):
+    # pc_1h 값이 없으면 pc 필터는 건너뜀(차단 안 함).
+    tok = _tok()  # price_change_1h_pct 없음
+    assert shadow_rules.evaluate_shadow(tok, _gate_pass)["shadow_i_block_pump_chase"]["passed"] is True
+    assert shadow_rules.evaluate_shadow(tok, _gate_pass)["shadow_j_pullback_only"]["passed"] is True
+
+
+def test_hours_6_12(monkeypatch):
+    from types import SimpleNamespace
+
+    class _DT:
+        @staticmethod
+        def now(tz=None):
+            return SimpleNamespace(hour=_DT._h)
+    _DT._h = 8
+    monkeypatch.setattr(shadow_rules, "datetime", _DT)
+    assert shadow_rules.evaluate_shadow(_tok(), _gate_pass)["shadow_k_hours_6_12"]["passed"] is True
+    _DT._h = 20
+    assert shadow_rules.evaluate_shadow(_tok(), _gate_pass)["shadow_k_hours_6_12"]["passed"] is False
+
+
 if __name__ == "__main__":
     class _MP:
         def __init__(self): self._u = []
@@ -92,7 +129,8 @@ if __name__ == "__main__":
     for fn in (test_up_regime_blocks_e_and_f, test_flat_regime_blocks_neither,
                test_strong_up_blocks_only_f, test_gate_fail_is_not_relabeled_as_regime_block,
                test_unknown_regime_is_safe_passthrough, test_disable_sweet_spot_blocks_sweet_spot,
-               test_block_up_sweet_spot_combo):
+               test_block_up_sweet_spot_combo, test_block_pump_chase, test_pullback_only_range,
+               test_pc1h_missing_is_safe_passthrough, test_hours_6_12):
         mp = _MP()
         try:
             fn(mp)
