@@ -11,8 +11,11 @@ import json
 import sys
 from collections import defaultdict
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+KST = timezone(timedelta(hours=9))
+RECENT_DAYS = 7
 
 try:
     from dotenv import load_dotenv
@@ -280,18 +283,32 @@ def build_portfolio_summary(open_positions: list[dict], closed_positions: list[d
             unrealized_pnl_usd += size_usd * ((current_price / entry_price) - 1.0)
 
     realized_pnl_usd = sum(float(pos.get("realized_pnl_usd") or 0.0) for pos in closed_positions)
-    today = datetime.now().date()
+    # 타임존 버그 수정: exit_timestamp 는 UTC, today 는 KST 였음(9h 어긋남).
+    # exit 를 KST 로 변환 후 KST '오늘'과 비교. 최근 N일 실적도 같이 계산
+    # (헤드라인 realized 는 lifetime 이라 동결버그 시대에 묻혀 현재 상태가 안 보였음).
+    now_kst = datetime.now(KST)
+    today = now_kst.date()
+    recent_cutoff = now_kst - timedelta(days=RECENT_DAYS)
     realized_today_usd = 0.0
+    realized_recent_usd = 0.0
+    recent_count = 0
     for pos in closed_positions:
         exit_timestamp = pos.get("exit_timestamp")
         if not exit_timestamp:
             continue
         try:
-            exit_dt = datetime.fromisoformat(exit_timestamp)
+            exit_dt = datetime.fromisoformat(str(exit_timestamp).replace("Z", "+00:00"))
         except Exception:
             continue
-        if exit_dt.date() == today:
-            realized_today_usd += float(pos.get("realized_pnl_usd") or 0.0)
+        if exit_dt.tzinfo is None:
+            exit_dt = exit_dt.replace(tzinfo=timezone.utc)
+        exit_kst = exit_dt.astimezone(KST)
+        amount = float(pos.get("realized_pnl_usd") or 0.0)
+        if exit_kst.date() == today:
+            realized_today_usd += amount
+        if exit_kst >= recent_cutoff:
+            realized_recent_usd += amount
+            recent_count += 1
 
     return {
         "open_count": len(open_positions),
@@ -300,6 +317,8 @@ def build_portfolio_summary(open_positions: list[dict], closed_positions: list[d
         "unrealized_pnl_usd": unrealized_pnl_usd,
         "realized_pnl_usd": realized_pnl_usd,
         "realized_today_usd": realized_today_usd,
+        "realized_recent_usd": realized_recent_usd,
+        "recent_count": recent_count,
     }
 
 
@@ -511,9 +530,9 @@ def render_dashboard() -> str:
       <div class="panel">
         <div class="eyebrow">Quick Status</div>
         <div class="hint">Open positions {portfolio['open_count']} / Closed {portfolio['closed_count']}</div>
-        <div class="value">{_fmt_usd(portfolio['realized_pnl_usd'])}</div>
-        <div class="hint">Realized total</div>
-        <div class="hint" style="margin-top:12px;">Today {_fmt_usd(portfolio['realized_today_usd'])} | Unrealized {_fmt_usd(portfolio['unrealized_pnl_usd'])}</div>
+        <div class="value">{_fmt_usd(portfolio['realized_recent_usd'])}</div>
+        <div class="hint">Realized last {RECENT_DAYS}d ({portfolio['recent_count']} trades) &mdash; 현재 상태</div>
+        <div class="hint" style="margin-top:12px;">Lifetime {_fmt_usd(portfolio['realized_pnl_usd'])} | Today(KST) {_fmt_usd(portfolio['realized_today_usd'])} | Unrealized {_fmt_usd(portfolio['unrealized_pnl_usd'])}</div>
         <div class="hint">Safety halt: {safety.get('halt_reason') or 'off'}</div>
       </div>
     </div>
@@ -608,7 +627,7 @@ def render_dashboard() -> str:
             <div class="eyebrow">Postmortem</div>
             <h2>Scenario Comparison</h2>
           </div>
-          <p>공통 시뮬 엔진 기준 백테스트 비교</p>
+          <p>⚠ 시뮬레이션(예측) &mdash; 실제 실적 아님. 위 Quick Status(realized)가 실제 장부.</p>
         </div>
         <table>
           <tr><th>Scenario</th><th>Trades</th><th>Closed</th><th>Win %</th><th>Total PnL</th><th>Avg / Trade</th><th>PF</th></tr>
