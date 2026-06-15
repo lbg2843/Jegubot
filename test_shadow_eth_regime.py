@@ -105,6 +105,22 @@ def test_pc1h_missing_is_safe_passthrough(monkeypatch):
     assert shadow_rules.evaluate_shadow(tok, _gate_pass)["shadow_j_pullback_only"]["passed"] is True
 
 
+def test_base_eth24h_down(monkeypatch):
+    R = "shadow_m_base_eth24h_down"
+    base = dict(_tok(), chain="base")
+    bsc = dict(_tok(), chain="bsc")
+    # ETH 24h 하락 -> base 차단, bsc 통과(eth_chains=base)
+    monkeypatch.setattr(shadow_rules, "_current_eth_24h_pct", lambda: -1.0)
+    assert shadow_rules.evaluate_shadow(base, _gate_pass)[R]["passed"] is False
+    assert shadow_rules.evaluate_shadow(bsc, _gate_pass)[R]["passed"] is True
+    # ETH 24h 상승 -> base 통과
+    monkeypatch.setattr(shadow_rules, "_current_eth_24h_pct", lambda: +1.0)
+    assert shadow_rules.evaluate_shadow(base, _gate_pass)[R]["passed"] is True
+    # 미가용(None) -> 차단 안 함
+    monkeypatch.setattr(shadow_rules, "_current_eth_24h_pct", lambda: None)
+    assert shadow_rules.evaluate_shadow(base, _gate_pass)[R]["passed"] is True
+
+
 def test_hours_6_12(monkeypatch):
     from types import SimpleNamespace
 
@@ -142,7 +158,8 @@ if __name__ == "__main__":
                test_strong_up_blocks_only_f, test_gate_fail_is_not_relabeled_as_regime_block,
                test_unknown_regime_is_safe_passthrough, test_disable_sweet_spot_blocks_sweet_spot,
                test_block_up_sweet_spot_combo, test_block_pump_chase, test_pullback_only_range,
-               test_pc1h_missing_is_safe_passthrough, test_hours_6_12, test_score_below_floor):
+               test_pc1h_missing_is_safe_passthrough, test_hours_6_12, test_score_below_floor,
+               test_base_eth24h_down):
         mp = _MP()
         try:
             fn(mp)

@@ -1279,8 +1279,10 @@ class Orchestrator:
                 # 진입시점 ETH 4h 레짐 태깅 (분석 전용). 게이트가 이미 받아둔 캐시
                 # 스냅샷 재사용 → 추가 네트워크 호출 없음. 사후 상관분석에서 "완만한
                 # 상승(up)" 레짐 거래만 따로 묶어 재검증하기 위함.
-                eth_change_4h, eth_regime = get_eth_macro_filter().current_regime()
-                eth_extra = {"eth_4h_pct": eth_change_4h, "eth_4h_regime": eth_regime}
+                _eth_filter = get_eth_macro_filter()
+                eth_change_4h, eth_regime = _eth_filter.current_regime()
+                eth_extra = {"eth_4h_pct": eth_change_4h, "eth_4h_regime": eth_regime,
+                             "eth_24h_pct": _eth_filter.current_eth_24h_pct()}
                 if self.executor:
                     signal = self._build_trade_signal(cand, chain)
                     result = self.executor.submit_entry_signal(signal)

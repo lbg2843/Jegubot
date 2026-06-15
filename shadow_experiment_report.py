@@ -78,6 +78,7 @@ def load_entries(since):
             "pc_1h": _pc1h(r), "utc_hour": r.get("utc_hour"),
             "eth_4h_regime": r.get("eth_4h_regime"),
             "final_score": r.get("final_score"),
+            "eth_24h_pct": r.get("eth_24h_pct"),
         })
     return out
 
@@ -187,6 +188,13 @@ def arm_blocks(overrides, e):
         if not isinstance(sc, (int, float)) or (chains is not None and e.get("chain") not in chains):
             return False, False  # 점수 미태깅/체인 불일치 → 평가 불가
         return sc < overrides["block_if_score_below"], True
+
+    if "block_if_eth24h_below" in overrides:
+        v = e.get("eth_24h_pct")
+        chains = overrides.get("eth_chains")
+        if not isinstance(v, (int, float)) or (chains is not None and e.get("chain") not in chains):
+            return False, False  # eth_24h 미태깅/체인 불일치 → 평가 불가
+        return v < overrides["block_if_eth24h_below"], True
 
     return False, False
 

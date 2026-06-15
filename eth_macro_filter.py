@@ -27,6 +27,7 @@ class EthMacroSnapshot:
     change_4h_pct: Optional[float]
     fetched_at: Optional[datetime]
     source: str = 'binance'
+    change_24h_pct: Optional[float] = None
 
 
 # ETH 4h 변동률 레짐 밴드. 경계는 btc_correlation 분석 버킷과 동일하게 유지해야
@@ -69,20 +70,27 @@ class EthMacroFilter:
             return -1.5
 
     def _fetch_snapshot(self) -> EthMacroSnapshot:
-        url = 'https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=1h&limit=5'
+        # 25개(=24h+여유) 받아 4h/24h 둘 다 계산. 4h 게이트는 기존과 동일(closes[-5]).
+        url = 'https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=1h&limit=25'
         with urlopen(url, timeout=10) as resp:
             payload = json.loads(resp.read().decode('utf-8'))
         if not isinstance(payload, list) or len(payload) < 5:
             raise RuntimeError('unexpected_binance_payload')
         closes = [float(row[4]) for row in payload]
         current_price = closes[-1]
-        price_4h_ago = closes[0]
+        price_4h_ago = closes[-5]
         change_4h_pct = ((current_price - price_4h_ago) / price_4h_ago * 100.0) if price_4h_ago > 0 else None
+        change_24h_pct = None
+        if len(closes) >= 25:
+            price_24h_ago = closes[-25]
+            if price_24h_ago > 0:
+                change_24h_pct = (current_price - price_24h_ago) / price_24h_ago * 100.0
         return EthMacroSnapshot(
             current_price=current_price,
             price_4h_ago=price_4h_ago,
             change_4h_pct=change_4h_pct,
             fetched_at=datetime.now(timezone.utc),
+            change_24h_pct=change_24h_pct,
         )
 
     def get_snapshot(self) -> EthMacroSnapshot:
@@ -104,6 +112,12 @@ class EthMacroFilter:
         스냅샷을 재사용하므로 추가 네트워크 호출이 없다(미가용 시 (None,'unknown'))."""
         snap = self.get_snapshot()
         return snap.change_4h_pct, classify_eth_4h_regime(snap.change_4h_pct)
+
+    def current_eth_24h_pct(self) -> Optional[float]:
+        """진입시점 ETH 24h 변동률(캐시 스냅샷 재사용). 미가용 시 None.
+        base 가 ETH 하락에 약하다는 관측(ETH24h<=0 시 base 평균 -1.8% vs 상승 -0.5%)
+        검증용 게이트(shadow)에서 사용."""
+        return self.get_snapshot().change_24h_pct
 
     def should_block_entry(self) -> tuple[bool, str]:
         if not self.enabled:

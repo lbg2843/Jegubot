@@ -72,6 +72,13 @@ SHADOW_RULES = {
         'block_if_score_below': 0.15,
         'score_chains': ['base'],
     },
+    # 실험(2026-06-15): base 는 ETH 하락에 약함(ETH 24h<=0 시 base 평균 -1.8% vs 상승 -0.5%,
+    # n=285/181). ETH 24h 하락 시 base 진입 차단했으면 나았는지 검증. (bsc 는 BNB 와 무상관이라 제외)
+    'shadow_m_base_eth24h_down': {
+        'description': 'block base entries when ETH 24h <= 0',
+        'block_if_eth24h_below': 0.0,
+        'eth_chains': ['base'],
+    },
 }
 
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'shadow_decisions.jsonl'
@@ -89,9 +96,18 @@ def _current_eth_4h_regime() -> str:
         return 'unknown'
 
 
+def _current_eth_24h_pct():
+    """진입시점 ETH 24h 변동률(캐시 스냅샷 재사용). 실패/미가용 시 None → 차단 안 함."""
+    try:
+        from eth_macro_filter import get_eth_macro_filter
+        return get_eth_macro_filter().current_eth_24h_pct()
+    except Exception:
+        return None
+
+
 # 게이트 통과 후 진입 피처로 거르는 실험 키들(파라미터 override 가 아님).
 _POST_GATE_KEYS = ('block_eth_regimes', 'block_if_pc1h_above', 'allow_pc1h_range', 'allow_utc_hours',
-                   'block_if_score_below')
+                   'block_if_score_below', 'block_if_eth24h_below')
 
 
 def _pc_1h(token_dict: dict):
@@ -135,6 +151,13 @@ def _post_gate_block_reason(token_dict: dict, overrides: dict):
             thr = overrides['block_if_score_below']
             if sc < thr:
                 return f'score_below_{thr}({sc:.3f})'
+
+    if 'block_if_eth24h_below' in overrides:
+        chains = overrides.get('eth_chains')
+        if chains is None or token_dict.get('chain') in chains:
+            eth24 = _current_eth_24h_pct()
+            if eth24 is not None and eth24 < overrides['block_if_eth24h_below']:
+                return f'eth24h_below_{overrides["block_if_eth24h_below"]}({eth24:+.2f})'
     return None
 
 
