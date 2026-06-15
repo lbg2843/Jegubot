@@ -789,7 +789,7 @@ class Orchestrator:
             "entry_reason": entry_reason,
         }
         with self.score_shadow_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\\n")
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _score_shadow_result_taken(self, result: dict | None) -> bool:
         if not result:
