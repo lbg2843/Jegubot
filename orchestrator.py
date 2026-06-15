@@ -1283,6 +1283,13 @@ class Orchestrator:
                 eth_change_4h, eth_regime = _eth_filter.current_regime()
                 eth_extra = {"eth_4h_pct": eth_change_4h, "eth_4h_regime": eth_regime,
                              "eth_24h_pct": _eth_filter.current_eth_24h_pct()}
+                # divergence v1 태깅(Module 2): 인식(pc_1h) vs 실수요(매수압) 괴리.
+                # 진입 결정엔 안 쓰고 기록만 — forward 검증 후 게이트화 결정.
+                try:
+                    from divergence import compute as _div_compute
+                    eth_extra.update(_div_compute(cand))
+                except Exception:
+                    pass
                 if self.executor:
                     signal = self._build_trade_signal(cand, chain)
                     result = self.executor.submit_entry_signal(signal)
