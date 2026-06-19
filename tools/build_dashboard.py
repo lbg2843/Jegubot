@@ -271,6 +271,54 @@ def load_positions() -> tuple[list[dict], list[dict]]:
     return list(open_positions.values()), closed_positions
 
 
+def load_latest_prices(open_positions: list[dict]) -> dict[tuple[str, str], tuple[float, str | None]]:
+    """오픈 포지션의 contract 에 대해 체인별 snapshots.jsonl 에서 최신 가격을 찾는다.
+
+    positions.jsonl 의 오픈(진입) 행은 current_price=entry 로 고정되어 있어 PnL 이
+    0% 로 보인다. 봇은 메모리에서 실시간 갱신하지만 파일엔 진입/청산만 남는다.
+    그래서 대시보드는 최신 스냅샷 가격으로 오픈 포지션 평가손익을 보강해야 한다.
+    snapshots.jsonl 은 시간순 append → 마지막 매칭 행이 최신가."""
+    wanted: dict[str, set[str]] = {}
+    for pos in open_positions:
+        chain = (pos.get("chain") or "").lower()
+        contract = (pos.get("contract_address") or "").lower()
+        if chain and contract:
+            wanted.setdefault(chain, set()).add(contract)
+
+    prices: dict[tuple[str, str], tuple[float, str | None]] = {}
+    for chain, contracts in wanted.items():
+        path = DATA_DIR / f"{chain}_snapshots.jsonl"
+        if not path.exists():
+            continue
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                # JSON 파싱 비용 회피: contract 문자열이 줄에 없으면 건너뜀
+                if not any(sub in line for sub in contracts):
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                contract = (rec.get("contract_address") or "").lower()
+                if contract not in contracts:
+                    continue
+                price = rec.get("price_usd")
+                if price:
+                    prices[(chain, contract)] = (float(price), rec.get("timestamp"))
+    return prices
+
+
+def enrich_open_positions_with_live_price(open_positions: list[dict]) -> None:
+    """오픈 포지션의 current_price 를 최신 스냅샷가로 덮어써 평가손익을 실시간화."""
+    live = load_latest_prices(open_positions)
+    for pos in open_positions:
+        key = ((pos.get("chain") or "").lower(), (pos.get("contract_address") or "").lower())
+        hit = live.get(key)
+        if hit and hit[0] > 0:
+            pos["current_price"] = hit[0]
+            pos["_live_price_ts"] = hit[1]
+
+
 def build_portfolio_summary(open_positions: list[dict], closed_positions: list[dict]) -> dict:
     unrealized_pnl_usd = 0.0
     committed_usd = 0.0
@@ -426,6 +474,7 @@ def render_dashboard() -> str:
 
     wallet_statuses = load_wallet_statuses()
     open_positions, closed_positions = load_positions()
+    enrich_open_positions_with_live_price(open_positions)  # 진입행 고정가 → 최신 스냅샷가로 보강
     portfolio = build_portfolio_summary(open_positions, closed_positions)
     chain_rows = build_chain_breakdown(open_positions, closed_positions)
     safety = load_safety_state()
@@ -477,6 +526,9 @@ def render_dashboard() -> str:
         size_usd = float(pos.get("size_usd") or 0.0)
         pnl_pct = ((current_price / entry_price) - 1.0) * 100.0 if entry_price else 0.0
         pnl_usd = size_usd * (pnl_pct / 100.0)
+        # 최신 스냅샷가로 보강됐으면 그 시각을, 아니면 last_update 를 표시
+        updated = pos.get("_live_price_ts") or pos.get("last_update") or "-"
+        live_tag = " <span class='pill ok'>live</span>" if pos.get("_live_price_ts") else ""
         open_table_rows.append(
             "<tr>"
             f"<td>{(pos.get('chain') or '').upper()}</td>"
@@ -486,7 +538,7 @@ def render_dashboard() -> str:
             f"<td>{_fmt_pct(pnl_pct)}</td>"
             f"<td>{_fmt_usd(pnl_usd)}</td>"
             f"<td>{_fmt_usd(size_usd)}</td>"
-            f"<td>{pos.get('last_update') or '-'}</td>"
+            f"<td>{updated}{live_tag}</td>"
             "</tr>"
         )
     if not open_table_rows:
