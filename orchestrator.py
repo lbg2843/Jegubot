@@ -1290,6 +1290,13 @@ class Orchestrator:
                     eth_extra.update(_div_compute(cand))
                 except Exception:
                     pass
+                # Web3 API 홀더 enrich(스크래퍼가 못 주던 holders/집중도/risk).
+                # 진입마다 기록 → 시간차로 홀더증가율 = 진짜 reflexivity divergence. 기록만.
+                try:
+                    from web3_client import fetch_token_enrich
+                    eth_extra.update(fetch_token_enrich(chain, cand.get("contract_address")))
+                except Exception:
+                    pass
                 if self.executor:
                     signal = self._build_trade_signal(cand, chain)
                     result = self.executor.submit_entry_signal(signal)
