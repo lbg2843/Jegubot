@@ -80,6 +80,8 @@ def load_entries(since):
             "final_score": r.get("final_score"),
             "eth_24h_pct": r.get("eth_24h_pct"),
             "divergence_score": r.get("divergence_score"),
+            "vol_1h_usd": r.get("vol_1h_usd"),
+            "pool_age_hours": r.get("pool_age_hours"),
         })
     return out
 
@@ -202,6 +204,22 @@ def arm_blocks(overrides, e):
         if not isinstance(v, (int, float)):
             return False, False  # divergence 미태깅 → 평가 불가
         return v < overrides["block_if_divergence_below"], True
+
+    # vol_1h / pool_age (단일 또는 결합=OR). 하나라도 피처 있으면 평가 가능.
+    if "block_if_vol1h_above" in overrides or "block_if_pool_age_above" in overrides:
+        blocked = False
+        evaluable = False
+        if "block_if_vol1h_above" in overrides:
+            v = e.get("vol_1h_usd")
+            if isinstance(v, (int, float)):
+                evaluable = True
+                blocked = blocked or v > overrides["block_if_vol1h_above"]
+        if "block_if_pool_age_above" in overrides:
+            a = e.get("pool_age_hours")
+            if isinstance(a, (int, float)):
+                evaluable = True
+                blocked = blocked or a > overrides["block_if_pool_age_above"]
+        return blocked, evaluable
 
     return False, False
 

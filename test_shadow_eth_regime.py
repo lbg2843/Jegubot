@@ -118,6 +118,34 @@ def test_block_divergence_below(monkeypatch):
     assert shadow_rules.evaluate_shadow(miss, _gate_pass)[R]["passed"] is True
 
 
+def test_block_high_vol1h(monkeypatch):
+    R = "shadow_p_block_high_vol1h"  # 임계 18500
+    hi = dict(_tok(), volume_1h_usd=50000)   # 고볼륨 -> 차단
+    lo = dict(_tok(), volume_1h_usd=5000)    # 저볼륨 -> 통과
+    miss = _tok()                             # vol 없음 -> 패스스루
+    assert shadow_rules.evaluate_shadow(hi, _gate_pass)[R]["passed"] is False
+    assert shadow_rules.evaluate_shadow(lo, _gate_pass)[R]["passed"] is True
+    assert shadow_rules.evaluate_shadow(miss, _gate_pass)[R]["passed"] is True
+
+
+def test_block_old_pool(monkeypatch):
+    R = "shadow_q_block_old_pool"  # 임계 3100
+    old = dict(_tok(), pool_age_hours=8000)   # 노후 -> 차단
+    young = dict(_tok(), pool_age_hours=500)  # 어림 -> 통과
+    assert shadow_rules.evaluate_shadow(old, _gate_pass)[R]["passed"] is False
+    assert shadow_rules.evaluate_shadow(young, _gate_pass)[R]["passed"] is True
+
+
+def test_anti_crowded_combo_or(monkeypatch):
+    R = "shadow_r_anti_crowded"  # vol>18500 OR pool_age>3100
+    only_vol = dict(_tok(), volume_1h_usd=50000, pool_age_hours=500)
+    only_age = dict(_tok(), volume_1h_usd=5000, pool_age_hours=8000)
+    neither = dict(_tok(), volume_1h_usd=5000, pool_age_hours=500)
+    assert shadow_rules.evaluate_shadow(only_vol, _gate_pass)[R]["passed"] is False
+    assert shadow_rules.evaluate_shadow(only_age, _gate_pass)[R]["passed"] is False
+    assert shadow_rules.evaluate_shadow(neither, _gate_pass)[R]["passed"] is True
+
+
 def test_base_eth24h_down(monkeypatch):
     R = "shadow_m_base_eth24h_down"
     base = dict(_tok(), chain="base")
@@ -172,7 +200,8 @@ if __name__ == "__main__":
                test_unknown_regime_is_safe_passthrough, test_disable_sweet_spot_blocks_sweet_spot,
                test_block_up_sweet_spot_combo, test_block_pump_chase, test_pullback_only_range,
                test_pc1h_missing_is_safe_passthrough, test_hours_6_12, test_score_below_floor,
-               test_base_eth24h_down, test_block_divergence_below):
+               test_base_eth24h_down, test_block_divergence_below,
+               test_block_high_vol1h, test_block_old_pool, test_anti_crowded_combo_or):
         mp = _MP()
         try:
             fn(mp)

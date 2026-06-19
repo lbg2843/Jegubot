@@ -90,6 +90,22 @@ SHADOW_RULES = {
         'description': 'block entries with divergence_score < -0.25 (mid_neutral 까지 포함)',
         'block_if_divergence_below': -0.25,
     },
+    # 실험(2026-06-20): entry_signal_outcome 분리력 랭킹 — full-sample(n167)에서
+    # vol_1h 낮을수록 / pool_age 어릴수록 우세(상위½ vs 하위½ 격차 -1.6%p, -1.4%p).
+    # "이미 붐비는/발견된 토큰 추격 = 패자" → 안 쫓기 가설. 중앙값 위(나쁜 절반) 차단.
+    'shadow_p_block_high_vol1h': {
+        'description': 'block entries with vol_1h_usd > 18500 (고볼륨=이미 붐빔)',
+        'block_if_vol1h_above': 18500.0,
+    },
+    'shadow_q_block_old_pool': {
+        'description': 'block entries with pool_age_hours > 3100 (노후 풀=이미 발견됨)',
+        'block_if_pool_age_above': 3100.0,
+    },
+    'shadow_r_anti_crowded': {
+        'description': 'block if vol_1h>18500 OR pool_age>3100 (안 쫓기 결합)',
+        'block_if_vol1h_above': 18500.0,
+        'block_if_pool_age_above': 3100.0,
+    },
 }
 
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'shadow_decisions.jsonl'
@@ -118,7 +134,8 @@ def _current_eth_24h_pct():
 
 # 게이트 통과 후 진입 피처로 거르는 실험 키들(파라미터 override 가 아님).
 _POST_GATE_KEYS = ('block_eth_regimes', 'block_if_pc1h_above', 'allow_pc1h_range', 'allow_utc_hours',
-                   'block_if_score_below', 'block_if_eth24h_below', 'block_if_divergence_below')
+                   'block_if_score_below', 'block_if_eth24h_below', 'block_if_divergence_below',
+                   'block_if_vol1h_above', 'block_if_pool_age_above')
 
 
 def _divergence_of(token_dict):
@@ -135,6 +152,22 @@ def _divergence_of(token_dict):
 
 def _pc_1h(token_dict: dict):
     for k in ('price_change_1h_pct', 'price_change_1h', 'pc_1h'):
+        v = token_dict.get(k)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return None
+
+
+def _vol_1h(token_dict: dict):
+    for k in ('volume_1h_usd', 'volume_1h', 'vol_1h', 'vol_1h_usd'):
+        v = token_dict.get(k)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return None
+
+
+def _pool_age(token_dict: dict):
+    for k in ('pool_age_hours', 'pool_age_h'):
         v = token_dict.get(k)
         if isinstance(v, (int, float)):
             return float(v)
@@ -186,6 +219,16 @@ def _post_gate_block_reason(token_dict: dict, overrides: dict):
         div = _divergence_of(token_dict)
         if div is not None and div < overrides['block_if_divergence_below']:
             return f'divergence_below_{overrides["block_if_divergence_below"]}({div:+.3f})'
+
+    if 'block_if_vol1h_above' in overrides:
+        vol = _vol_1h(token_dict)
+        if vol is not None and vol > overrides['block_if_vol1h_above']:
+            return f'vol1h_above_{overrides["block_if_vol1h_above"]:.0f}({vol:.0f})'
+
+    if 'block_if_pool_age_above' in overrides:
+        age = _pool_age(token_dict)
+        if age is not None and age > overrides['block_if_pool_age_above']:
+            return f'pool_age_above_{overrides["block_if_pool_age_above"]:.0f}({age:.0f})'
     return None
 
 
