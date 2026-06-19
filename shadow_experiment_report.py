@@ -79,6 +79,7 @@ def load_entries(since):
             "eth_4h_regime": r.get("eth_4h_regime"),
             "final_score": r.get("final_score"),
             "eth_24h_pct": r.get("eth_24h_pct"),
+            "divergence_score": r.get("divergence_score"),
         })
     return out
 
@@ -195,6 +196,12 @@ def arm_blocks(overrides, e):
         if not isinstance(v, (int, float)) or (chains is not None and e.get("chain") not in chains):
             return False, False  # eth_24h 미태깅/체인 불일치 → 평가 불가
         return v < overrides["block_if_eth24h_below"], True
+
+    if "block_if_divergence_below" in overrides:
+        v = e.get("divergence_score")
+        if not isinstance(v, (int, float)):
+            return False, False  # divergence 미태깅 → 평가 불가
+        return v < overrides["block_if_divergence_below"], True
 
     return False, False
 

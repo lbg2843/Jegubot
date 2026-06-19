@@ -105,6 +105,19 @@ def test_pc1h_missing_is_safe_passthrough(monkeypatch):
     assert shadow_rules.evaluate_shadow(tok, _gate_pass)["shadow_j_pullback_only"]["passed"] is True
 
 
+def test_block_divergence_below(monkeypatch):
+    # divergence_score = (buy_ratio-0.5) - max(0,pc_1h)/20
+    R = "shadow_n_block_div_below"  # 임계 -0.5
+    # 과열+매도우위: pc_1h=15, buys/sells 30/70 -> (0.3-0.5) - 15/20 = -0.95 < -0.5 -> 차단
+    bad = dict(_tok(), price_change_1h_pct=15.0, buys_1h=30, sells_1h=70)
+    # 평탄+매수우위: pc_1h=0, 70/30 -> +0.2 -> 통과
+    good = dict(_tok(), price_change_1h_pct=0.0, buys_1h=70, sells_1h=30)
+    miss = dict(_tok(), price_change_1h_pct=15.0)  # buys/sells 없음 -> 패스스루
+    assert shadow_rules.evaluate_shadow(bad, _gate_pass)[R]["passed"] is False
+    assert shadow_rules.evaluate_shadow(good, _gate_pass)[R]["passed"] is True
+    assert shadow_rules.evaluate_shadow(miss, _gate_pass)[R]["passed"] is True
+
+
 def test_base_eth24h_down(monkeypatch):
     R = "shadow_m_base_eth24h_down"
     base = dict(_tok(), chain="base")
@@ -159,7 +172,7 @@ if __name__ == "__main__":
                test_unknown_regime_is_safe_passthrough, test_disable_sweet_spot_blocks_sweet_spot,
                test_block_up_sweet_spot_combo, test_block_pump_chase, test_pullback_only_range,
                test_pc1h_missing_is_safe_passthrough, test_hours_6_12, test_score_below_floor,
-               test_base_eth24h_down):
+               test_base_eth24h_down, test_block_divergence_below):
         mp = _MP()
         try:
             fn(mp)

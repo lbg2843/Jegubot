@@ -79,6 +79,17 @@ SHADOW_RULES = {
         'block_if_eth24h_below': 0.0,
         'eth_chains': ['base'],
     },
+    # 실험(2026-06-19): divergence realized 검증 - score<-0.5(과열+매도우위)가 -9.5%,
+    # mid_neutral(중간모멘텀)이 -10%. divergence_score 낮은 진입(인식이 실수요 앞섬)을
+    # 차단했으면 나았는지. probe/divergence/realized 셋 다 '과열 회피' 일관 -> 진짜 후보.
+    'shadow_n_block_div_below': {
+        'description': 'block entries with divergence_score < -0.5 (과열+매도우위)',
+        'block_if_divergence_below': -0.5,
+    },
+    'shadow_o_block_div_below_strict': {
+        'description': 'block entries with divergence_score < -0.25 (mid_neutral 까지 포함)',
+        'block_if_divergence_below': -0.25,
+    },
 }
 
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'shadow_decisions.jsonl'
@@ -107,7 +118,19 @@ def _current_eth_24h_pct():
 
 # 게이트 통과 후 진입 피처로 거르는 실험 키들(파라미터 override 가 아님).
 _POST_GATE_KEYS = ('block_eth_regimes', 'block_if_pc1h_above', 'allow_pc1h_range', 'allow_utc_hours',
-                   'block_if_score_below', 'block_if_eth24h_below')
+                   'block_if_score_below', 'block_if_eth24h_below', 'block_if_divergence_below')
+
+
+def _divergence_of(token_dict):
+    """candidate 의 divergence_score(인식 vs 실수요). 데이터 없으면 None -> 차단 안 함."""
+    try:
+        from divergence import divergence_score
+        pc = token_dict.get('price_change_1h_pct')
+        if pc is None:
+            pc = token_dict.get('price_change_1h')
+        return divergence_score(pc, token_dict.get('buys_1h'), token_dict.get('sells_1h'))
+    except Exception:
+        return None
 
 
 def _pc_1h(token_dict: dict):
@@ -158,6 +181,11 @@ def _post_gate_block_reason(token_dict: dict, overrides: dict):
             eth24 = _current_eth_24h_pct()
             if eth24 is not None and eth24 < overrides['block_if_eth24h_below']:
                 return f'eth24h_below_{overrides["block_if_eth24h_below"]}({eth24:+.2f})'
+
+    if 'block_if_divergence_below' in overrides:
+        div = _divergence_of(token_dict)
+        if div is not None and div < overrides['block_if_divergence_below']:
+            return f'divergence_below_{overrides["block_if_divergence_below"]}({div:+.3f})'
     return None
 
 
