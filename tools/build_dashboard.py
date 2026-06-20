@@ -1,8 +1,9 @@
 """
-Jegubot 운용 대시보드 (간결판).
+Jegubot 운용 대시보드 (간결판 + 비용반영).
 
-필요한 것만: 총 PnL · 일/주/월 PnL + 그래프 · 승률 · 오픈 포지션(실시간) · 거래내역.
-기준일(CUTOFF) 이후만 집계 — 지난주 버그 수정 후의 깨끗한 베이스라인.
+필요한 것만: 총/순 PnL · 일/주/월 PnL + 그래프 · 승률 · 오픈 포지션(실시간) · 거래내역.
+기준일(CUTOFF) 이후만 집계. net = 슬리피지+수수료+가스(왕복 추정) 반영 → 실거래
+기준의 정직한 손익. gross 는 스냅샷가 기준(비용 0).
 
 Usage:
     python tools/build_dashboard.py
@@ -11,15 +12,26 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 KST = timezone(timedelta(hours=9))
 
-# 베이스라인 기준일 — 지난 일요일(2026-06-14, 버그 수정 직후 클린 구간).
-# 다른 날부터 보려면 이 한 줄만 바꾸면 됨.
+# 베이스라인 기준일 — 지난 일요일(버그 수정 직후 클린 구간). 바꾸려면 이 줄만.
 CUTOFF = date(2026, 6, 14)
+
+# 왕복 거래비용 추정(%) = LP수수료 + 슬리피지 + 가스. 보수적. env 로 덮어쓸 수 있음.
+# BSC Pancake 0.25%x2 + 슬리피지 + 가스($100기준) ~ 1.5% / BASE Uniswap 0.3%x2 + 가스저렴 ~ 1.2%
+def _cost_for(chain: str) -> float:
+    chain = (chain or "").lower()
+    default = {"bsc": 1.5, "base": 1.2, "solana": 1.5}.get(chain, 1.5)
+    try:
+        return float(os.getenv(f"{chain.upper()}_ROUNDTRIP_COST_PCT", str(default)))
+    except ValueError:
+        return default
+
 
 try:
     from dotenv import load_dotenv
@@ -59,7 +71,7 @@ h1 { font-size:34px; line-height:1.05; }
 .grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; margin:18px 0; }
 .metric { min-height:118px; }
 .metric .label { font-size:12px; text-transform:uppercase; letter-spacing:0.12em; color:var(--muted); }
-.metric .value { margin-top:10px; font-size:30px; font-weight:700; }
+.metric .value { margin-top:10px; font-size:28px; font-weight:700; }
 .metric .hint { margin-top:8px; color:var(--muted); font-size:13px; }
 .section { margin-top:18px; }
 .section-head { display:flex; justify-content:space-between; align-items:end; margin-bottom:12px; }
@@ -125,7 +137,6 @@ def load_positions() -> tuple[list[dict], list[dict]]:
 
 
 def load_latest_prices(open_positions: list[dict]) -> dict[tuple[str, str], tuple[float, str | None]]:
-    """오픈 포지션 contract 의 최신 스냅샷가 (positions.jsonl 오픈행은 entry 고정이라 보강 필요)."""
     wanted: dict[str, set[str]] = {}
     for pos in open_positions:
         chain = (pos.get("chain") or "").lower()
@@ -172,7 +183,7 @@ def load_safety_state() -> dict:
 
 
 # ----------------------------------------------------------------------------
-# 집계
+# 집계 (gross = 스냅샷가, net = 비용 반영)
 # ----------------------------------------------------------------------------
 def _exit_kst(pos: dict) -> datetime | None:
     ts = pos.get("exit_timestamp")
@@ -187,44 +198,71 @@ def _exit_kst(pos: dict) -> datetime | None:
     return d.astimezone(KST)
 
 
-def _pnl(pos: dict) -> float:
+def _gross_usd(pos: dict) -> float:
     try:
         return float(pos.get("realized_pnl_usd") or 0.0)
     except Exception:
         return 0.0
 
 
+def _net_usd(pos: dict) -> float:
+    size = float(pos.get("size_usd") or 0.0)
+    return _gross_usd(pos) - size * _cost_for(pos.get("chain")) / 100.0
+
+
+def _gross_pct(pos: dict) -> float | None:
+    try:
+        return float(pos.get("realized_pnl_pct"))
+    except Exception:
+        return None
+
+
+def _net_pct(pos: dict) -> float | None:
+    g = _gross_pct(pos)
+    return None if g is None else g - _cost_for(pos.get("chain"))
+
+
 def _stat(rows: list[dict]) -> dict:
     n = len(rows)
-    pnl = sum(_pnl(p) for p in rows)
-    wins = sum(1 for p in rows if _pnl(p) > 0)
-    return {"n": n, "pnl": pnl, "win": (wins / n * 100.0 if n else 0.0)}
+    gross = sum(_gross_usd(p) for p in rows)
+    net = sum(_net_usd(p) for p in rows)
+    wins = sum(1 for p in rows if _gross_usd(p) > 0)
+    netwins = sum(1 for p in rows if _net_usd(p) > 0)
+    return {
+        "n": n, "gross": gross, "net": net,
+        "win": (wins / n * 100.0 if n else 0.0),
+        "netwin": (netwins / n * 100.0 if n else 0.0),
+    }
 
 
 def daily_series(closed: list[dict], cutoff: date, today: date) -> list[dict]:
-    by_day: dict[date, list[float]] = {}
+    by_day: dict[date, list[dict]] = {}
     for p in closed:
         k = _exit_kst(p)
         if k and k.date() >= cutoff:
-            by_day.setdefault(k.date(), []).append(_pnl(p))
-    series, cum, d = [], 0.0, cutoff
+            by_day.setdefault(k.date(), []).append(p)
+    series, gcum, ncum, d = [], 0.0, 0.0, cutoff
     while d <= today:
         day = by_day.get(d, [])
-        cum += sum(day)
-        series.append({"date": d, "pnl": sum(day), "cum": cum, "n": len(day)})
+        g = sum(_gross_usd(p) for p in day)
+        nt = sum(_net_usd(p) for p in day)
+        gcum += g
+        ncum += nt
+        series.append({"date": d, "net": nt, "gcum": gcum, "ncum": ncum, "n": len(day)})
         d += timedelta(days=1)
     return series
 
 
 def render_pnl_chart(series: list[dict]) -> str:
-    """일별 PnL 막대 + 누적 PnL 곡선 (자체 SVG, 의존성 없음)."""
+    """일별 순손익 막대 + 누적 곡선(net 굵게, gross 점선). 자체 SVG, 의존성 없음."""
     if not series or all(s["n"] == 0 for s in series):
         return "<p class='muted'>기준일 이후 청산 거래가 아직 없습니다.</p>"
     W, H = 820, 300
     pl, pr, pt, pb = 50, 16, 18, 42
     iw, ih = W - pl - pr, H - pt - pb
     n = len(series)
-    vals = [s["cum"] for s in series] + [s["pnl"] for s in series] + [0.0]
+    vals = ([s["gcum"] for s in series] + [s["ncum"] for s in series]
+            + [s["net"] for s in series] + [0.0])
     ymin, ymax = min(vals), max(vals)
     if ymax == ymin:
         ymax = ymin + 1
@@ -239,13 +277,14 @@ def render_pnl_chart(series: list[dict]) -> str:
     bw = max(2.0, iw / n * 0.55)
     bars = []
     for i, s in enumerate(series):
-        y = Y(s["pnl"])
+        y = Y(s["net"])
         top = min(y, zero)
         h = max(abs(y - zero), 0.6)
-        color = "#2a9d8f" if s["pnl"] >= 0 else "#ae2012"
+        color = "#2a9d8f" if s["net"] >= 0 else "#ae2012"
         bars.append(f'<rect x="{X(i)-bw/2:.1f}" y="{top:.1f}" width="{bw:.1f}" height="{h:.1f}" fill="{color}" opacity="0.40"/>')
-    line_pts = " ".join(f"{X(i):.1f},{Y(s['cum']):.1f}" for i, s in enumerate(series))
-    dots = "".join(f'<circle cx="{X(i):.1f}" cy="{Y(s["cum"]):.1f}" r="2.6" fill="#005f73"/>' for i, s in enumerate(series))
+    gross_pts = " ".join(f"{X(i):.1f},{Y(s['gcum']):.1f}" for i, s in enumerate(series))
+    net_pts = " ".join(f"{X(i):.1f},{Y(s['ncum']):.1f}" for i, s in enumerate(series))
+    dots = "".join(f'<circle cx="{X(i):.1f}" cy="{Y(s["ncum"]):.1f}" r="2.6" fill="#005f73"/>' for i, s in enumerate(series))
     step = max(1, n // 8)
     xlabels = "".join(
         f'<text x="{X(i):.1f}" y="{H-pb+18:.1f}" font-size="11" fill="#6f665d" text-anchor="middle">{s["date"].strftime("%m/%d")}</text>'
@@ -260,9 +299,12 @@ def render_pnl_chart(series: list[dict]) -> str:
         f'<svg viewBox="0 0 {W} {H}" width="100%" style="max-width:{W}px">'
         f'<line x1="{pl}" y1="{zero:.1f}" x2="{W-pr}" y2="{zero:.1f}" stroke="#d7c7b4" stroke-dasharray="3 3"/>'
         f'{"".join(bars)}'
-        f'<polyline points="{line_pts}" fill="none" stroke="#005f73" stroke-width="2.5"/>'
+        f'<polyline points="{gross_pts}" fill="none" stroke="#b9a88f" stroke-width="1.5" stroke-dasharray="4 3"/>'
+        f'<polyline points="{net_pts}" fill="none" stroke="#005f73" stroke-width="2.6"/>'
         f'{dots}{xlabels}{ylabels}</svg>'
-        '<div class="hint" style="margin-top:8px">막대 = 일별 손익(녹/적) · 곡선 = 누적 손익</div>'
+        '<div class="hint" style="margin-top:8px">막대 = 일별 순손익 · '
+        '<span style="color:#005f73">━ 누적 순(net)</span> · '
+        '<span style="color:#b9a88f">┈ 누적 총(gross)</span></div>'
     )
 
 
@@ -279,7 +321,7 @@ def render_dashboard() -> str:
 
     now_kst = datetime.now(KST)
     today = now_kst.date()
-    week_start = today - timedelta(days=today.weekday())  # 이번주 월요일
+    week_start = today - timedelta(days=today.weekday())
 
     def bucket(pred):
         return [p for p in closed if pred(p)]
@@ -292,7 +334,6 @@ def render_dashboard() -> str:
     s_total, s_today, s_week, s_month = _stat(total), _stat(day_rows), _stat(week_rows), _stat(month_rows)
     s_life = _stat(closed)
 
-    # 오픈 평가손익
     unreal, committed = 0.0, 0.0
     for p in open_positions:
         size = float(p.get("size_usd") or 0.0)
@@ -305,12 +346,12 @@ def render_dashboard() -> str:
     series = daily_series(closed, CUTOFF, today)
     chart = render_pnl_chart(series)
 
-    # 기간 표
     def prow(label, st):
         return (
             "<tr>"
             f"<td>{label}</td>"
-            f"<td>{_fmt_usd(st['pnl'])}</td>"
+            f"<td>{_fmt_usd(st['net'])}</td>"
+            f"<td class='muted'>{_fmt_usd(st['gross'])}</td>"
             f"<td>{st['n']}</td>"
             f"<td>{st['win']:.0f}%</td>"
             "</tr>"
@@ -320,7 +361,6 @@ def render_dashboard() -> str:
         + prow(f"총 (기준일 {CUTOFF} 이후)", s_total)
     )
 
-    # 오픈 포지션
     open_sorted = sorted(open_positions, key=lambda r: float(r.get("size_usd") or 0.0), reverse=True)
     open_html = []
     for pos in open_sorted:
@@ -343,24 +383,23 @@ def render_dashboard() -> str:
     if not open_html:
         open_html.append("<tr><td colspan='7' class='muted'>오픈 포지션 없음</td></tr>")
 
-    # 거래내역 (기준일 이후, 최신순, 최대 50)
     hist = sorted(total, key=lambda p: _exit_kst(p) or datetime.min.replace(tzinfo=KST), reverse=True)[:50]
     hist_html = []
     for p in hist:
         k = _exit_kst(p)
-        pnl_pct = p.get("realized_pnl_pct")
         hist_html.append(
             "<tr>"
             f"<td>{k.strftime('%m/%d %H:%M') if k else '-'}</td>"
             f"<td>{(p.get('chain') or '').upper()}</td>"
             f"<td>{p.get('symbol') or '-'}</td>"
             f"<td>{p.get('exit_reason') or '-'}</td>"
-            f"<td>{_fmt_pct(float(pnl_pct) if pnl_pct is not None else None)}</td>"
-            f"<td>{_fmt_usd(_pnl(p))}</td>"
+            f"<td>{_fmt_pct(_net_pct(p))}</td>"
+            f"<td>{_fmt_usd(_net_usd(p))}</td>"
+            f"<td class='muted'>{_fmt_usd(_gross_usd(p))}</td>"
             "</tr>"
         )
     if not hist_html:
-        hist_html.append("<tr><td colspan='6' class='muted'>기준일 이후 청산 없음</td></tr>")
+        hist_html.append("<tr><td colspan='7' class='muted'>기준일 이후 청산 없음</td></tr>")
 
     halt = safety.get("halt_reason") or "off"
     halt_pill = "<span class='pill ok'>off</span>" if halt == "off" else f"<span class='pill err'>{halt}</span>"
@@ -377,27 +416,27 @@ def render_dashboard() -> str:
   <div class="wrap">
     <div class="panel">
       <div class="eyebrow">Jegubot · Paper</div>
-      <h1>{_fmt_usd(s_total['pnl'])} <span style="font-size:16px;color:var(--muted)">총 PnL · 승률 {s_total['win']:.0f}% · {s_total['n']}건</span></h1>
-      <div class="subtitle">기준일 {CUTOFF}(지난 일요일, 버그 수정 후) 이후 실현 손익. Lifetime {_fmt_usd(s_life['pnl'])} ({s_life['n']}건).</div>
+      <h1>{_fmt_usd(s_total['net'])} <span style="font-size:16px;color:var(--muted)">순 PnL(비용반영) · gross {_fmt_usd(s_total['gross'])} · 승률 {s_total['win']:.0f}% · {s_total['n']}건</span></h1>
+      <div class="subtitle">기준일 {CUTOFF} 이후. net = 왕복비용(BSC 1.5% / BASE 1.2%: 수수료+슬리피지+가스) 반영한 실거래 추정. Lifetime net {_fmt_usd(s_life['net'])} (gross {_fmt_usd(s_life['gross'])}, {s_life['n']}건).</div>
       <div class="stamp">Generated {now_kst.strftime("%Y-%m-%d %H:%M")} KST · Safety halt {halt_pill}</div>
     </div>
 
     <div class="grid">
-      <div class="panel metric"><div class="label">오늘 PnL</div><div class="value">{_fmt_usd(s_today['pnl'])}</div><div class="hint">{s_today['n']}건 · 승률 {s_today['win']:.0f}%</div></div>
-      <div class="panel metric"><div class="label">이번 주 PnL</div><div class="value">{_fmt_usd(s_week['pnl'])}</div><div class="hint">{s_week['n']}건 · 승률 {s_week['win']:.0f}%</div></div>
-      <div class="panel metric"><div class="label">이번 달 PnL</div><div class="value">{_fmt_usd(s_month['pnl'])}</div><div class="hint">{s_month['n']}건 · 승률 {s_month['win']:.0f}%</div></div>
-      <div class="panel metric"><div class="label">오픈 평가손익</div><div class="value">{_fmt_usd(unreal)}</div><div class="hint">{len(open_positions)}개 · 투입 ${committed:.0f}</div></div>
+      <div class="panel metric"><div class="label">오늘 (net)</div><div class="value">{_fmt_usd(s_today['net'])}</div><div class="hint">gross {_fmt_usd(s_today['gross'])} · {s_today['n']}건 · 승률 {s_today['win']:.0f}%</div></div>
+      <div class="panel metric"><div class="label">이번 주 (net)</div><div class="value">{_fmt_usd(s_week['net'])}</div><div class="hint">gross {_fmt_usd(s_week['gross'])} · {s_week['n']}건 · 승률 {s_week['win']:.0f}%</div></div>
+      <div class="panel metric"><div class="label">이번 달 (net)</div><div class="value">{_fmt_usd(s_month['net'])}</div><div class="hint">gross {_fmt_usd(s_month['gross'])} · {s_month['n']}건 · 승률 {s_month['win']:.0f}%</div></div>
+      <div class="panel metric"><div class="label">오픈 평가손익</div><div class="value">{_fmt_usd(unreal)}</div><div class="hint">{len(open_positions)}개 · 투입 ${committed:.0f} (gross)</div></div>
     </div>
 
     <div class="section panel">
-      <div class="section-head"><div><div class="eyebrow">Equity</div><h2>누적 손익 추이</h2></div><p>기준일 이후 일별/누적</p></div>
+      <div class="section-head"><div><div class="eyebrow">Equity</div><h2>누적 손익 추이</h2></div><p>기준일 이후 · net vs gross</p></div>
       {chart}
     </div>
 
     <div class="section panel">
       <div class="section-head"><div><div class="eyebrow">Periods</div><h2>기간별 손익 · 승률</h2></div></div>
       <table>
-        <tr><th>기간</th><th>PnL</th><th>거래수</th><th>승률</th></tr>
+        <tr><th>기간</th><th>순 PnL</th><th>gross</th><th>거래수</th><th>승률</th></tr>
         {period_rows}
       </table>
     </div>
@@ -411,9 +450,9 @@ def render_dashboard() -> str:
     </div>
 
     <div class="section panel">
-      <div class="section-head"><div><div class="eyebrow">History</div><h2>거래내역</h2></div><p>기준일 이후 청산 (최신 {len(hist)}건)</p></div>
+      <div class="section-head"><div><div class="eyebrow">History</div><h2>거래내역</h2></div><p>기준일 이후 청산 (최신 {len(hist)}건, PnL=net)</p></div>
       <table>
-        <tr><th>시각(KST)</th><th>Chain</th><th>Symbol</th><th>청산사유</th><th>PnL %</th><th>PnL $</th></tr>
+        <tr><th>시각(KST)</th><th>Chain</th><th>Symbol</th><th>청산사유</th><th>순 PnL %</th><th>순 $</th><th>gross $</th></tr>
         {''.join(hist_html)}
       </table>
     </div>
