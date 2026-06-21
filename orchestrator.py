@@ -714,6 +714,17 @@ class Orchestrator:
                 cfg.max_hold_hours,
             )
 
+        # phantom tracker: 게이트가 떨어낸 soft 컷(divergence/falling/eth_down/already_pumped)을
+        # 샤 치고 추적 → reason 별 가상 실현손익. 라이브 0 영향. PHANTOM_ENABLED=0 으로 끔.
+        self.phantom = None
+        if os.getenv("PHANTOM_ENABLED", "1") == "1":
+            try:
+                from phantom_tracker import PhantomTracker
+                self.phantom = PhantomTracker(self.pm.chain_configs)
+                log.info("[phantom] tracker on (open=%d)", len(self.phantom.open))
+            except Exception as e:
+                log.warning(f"[phantom] init failed (disabled): {e}")
+
         self.last_scrape: dict[str, float] = {"bsc": 0, "solana": 0, "base": 0}
         self.last_summary_bucket: str | None = None
         self.last_dashboard_bucket: str | None = None
@@ -1216,6 +1227,11 @@ class Orchestrator:
         self._write_heartbeat("before_position_update")
         self._inject_mock_signal(snapshots_by_chain)
         exits = self.pm.update_all(snapshots_by_chain)
+        if self.phantom is not None:
+            try:
+                self.phantom.update(snapshots_by_chain)
+            except Exception as e:
+                log.warning(f"[phantom] update error (continuing): {e}")
         self._write_heartbeat("after_position_update", exit_count=len(exits))
         for pos, reason, msg in exits:
             current_price = pos.current_price
@@ -1288,6 +1304,11 @@ class Orchestrator:
                         log.warning(f"[shadow] eval error (continuing): {e}")
 
                 if not ok:
+                    if self.phantom is not None:
+                        try:
+                            self.phantom.record_reject(cand, chain, reason)
+                        except Exception as e:
+                            log.warning(f"[phantom] record_reject error (continuing): {e}")
                     if str(reason).startswith("eth_4h_down") or str(reason).startswith("sweet_spot_falling"):
                         log.info(f"[{chain}] skip entry: {reason} symbol={cand.get('symbol')}")
                     else:
