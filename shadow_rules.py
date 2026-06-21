@@ -106,6 +106,16 @@ SHADOW_RULES = {
         'block_if_vol1h_above': 18500.0,
         'block_if_pool_age_above': 3100.0,
     },
+    # 승격(2026-06-21): arm o(div<-0.25)를 라이브 게이트로 하드 차단. 이 arm 은 그 반대로
+    # "여전히 허용했다면" 을 라이브에서 기록하는 REVERT 카나리아 — 게이트의 divergence
+    # 차단을 끈(env="") 채로 게이트를 돌려, 라이브가 지금 막는 진입을 decision-divergence 로
+    # 남긴다. 1주 후 (a) 라이브 base 승률/평균 추세 + (b) 이 카나리아 차단량으로 복구 여부 판단.
+    # ※ 차단된 진입은 실제로 안 들어가므로 그쪽 실현손익은 더는 관측 불가 — 남은 진입의
+    #   집계 성과로 판단해야 함(차단 전 6월: 남은 +4.99% vs 막은 -1.98% 가 가설).
+    'shadow_s_allow_div_revert': {
+        'description': 'REVERT canary: re-allow div<-0.25 entries that live gate now blocks',
+        'divergence_block_below': None,  # env override sentinel -> 라이브 div 차단 끄고 게이트 통과
+    },
 }
 
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'shadow_decisions.jsonl'
@@ -263,6 +273,13 @@ def evaluate_shadow(token_dict: dict, current_passes_safety_gate: Callable) -> d
                 key = 'SWEET_SPOT_MAX_15M_DROP_PCT'
                 backup_vars[key] = os.environ.get(key)
                 os.environ[key] = str(overrides['sweet_spot_max_15m_drop_pct'])
+
+            if 'divergence_block_below' in overrides:
+                # 라이브 게이트의 divergence 차단 임계를 일시 override. None → "" (차단 끔, revert 카나리아).
+                key = 'DIVERGENCE_BLOCK_BELOW'
+                backup_vars[key] = os.environ.get(key)
+                val = overrides['divergence_block_below']
+                os.environ[key] = '' if val is None else str(val)
 
             chain = token_dict.get('chain', 'base')
             passed, reason = current_passes_safety_gate(token_dict, chain)

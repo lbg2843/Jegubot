@@ -465,6 +465,25 @@ def passes_safety_gate(token_dict: dict, chain: str) -> tuple[bool, str]:
         log.debug(f"[{chain}] GATE FAIL {symbol}: audit_flags={token_dict['audit_flags']}")
         return False, f"audit_flags: {token_dict['audit_flags']}"
 
+    # divergence 게이트 (2026-06-21 승격). 인식(pc_1h)이 실수요(매수압)를 앞선 '과열' 진입 차단.
+    # shadow arm o(div<-0.25) 가 6월 표본(n63)에서 남은거래 +4.99%/d_mean +3.43
+    # (부트스트랩 CI [+0.56,+6.96], 0 미포함) 로 유일하게 통계적으로 입증되어 라이브화.
+    # buys/sells 결측(BSC 등)이면 score=None → 통과(현 동작 보존). DIVERGENCE_BLOCK_BELOW="" 로 끄면 복구.
+    _div_floor = os.getenv("DIVERGENCE_BLOCK_BELOW", "-0.25")
+    try:
+        _floor = float(_div_floor)
+    except (TypeError, ValueError):
+        _floor = None  # 빈 문자열/파싱불가 → divergence 차단 비활성(revert)
+    if _floor is not None:
+        from divergence import divergence_score as _dscore
+        _pc = token_dict.get("price_change_1h_pct")
+        if _pc is None:
+            _pc = token_dict.get("price_change_1h")
+        _ds = _dscore(_pc, token_dict.get("buys_1h"), token_dict.get("sells_1h"))
+        if _ds is not None and _ds < _floor:
+            log.info(f"[{chain}] GATE FAIL {symbol}: divergence={_ds:+.3f} < {_floor:+.2f} (과열 차단)")
+            return False, f"divergence_below_{_floor}({_ds:+.3f})"
+
     return True, "ok"
 
 
