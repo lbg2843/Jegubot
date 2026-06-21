@@ -6,7 +6,7 @@ Binance Web3 Wallet의 Trending 페이지를 기반으로 소로스 재귀성 �
 
 - **목표**: BSC + Base + Solana 3개 체인에서 Divergence 기반 진입/청산 신호 생성
 - **전략**: Quarter Kelly sizing + -20%스탑/트레일링15% + 체인별 파라미터 차등
-- **현재 단계**: Base + BSC 스크래퍼 + 포지션 매니저 완성. Solana와 Divergence 엔진은 미구현.
+- **현재 단계**: Base + BSC 스크래퍼 + 포지션 매니저 + **실거래 executor(Module 4) 완성**. Divergence v1 구현 후 2026-06-21 라이브 게이트화. 실거래는 코드 완비 — `.env` 플래그(`DRY_RUN`/`TRADING_MODE`)로만 페이퍼↔실거래 전환. Solana 스크래퍼만 미완.
 - **실행 환경**: Windows 데스크톱 (집 PC 상시 가동)
 
 ## 아키텍처
@@ -28,8 +28,11 @@ Binance Web3 Wallet의 Trending 페이지를 기반으로 소로스 재귀성 �
 | `mc_position_manager.py` | 멀티체인 포지션 관리 (-20% + 트레일링 15%) | 완료 |
 | `orchestrator.py` | 메인 루프, 모든 모듈 통합 | 완료 |
 | `solana_scraper.py` | Solana Trending (미구현) | TODO |
-| `divergence_engine.py` | 재귀성 지표 계산 (Module 2) | TODO |
-| `swap_executor.py` | PancakeSwap/Jupiter 실제 매매 (Module 4) | TODO |
+| `divergence.py` | 재귀성 지표 v1 (Module 2) — 진입 divergence_score, 라이브 게이트(div<-0.25) | 완료 |
+| `trading/executor.py` | 실거래 executor (Module 4) — 진입/청산 swap 실행, 라이브 지갑/안전체크 | 완료 |
+| `trading/dex_pancakeswap.py`, `trading/dex_jupiter.py` | BSC/Solana 실제 swap 체결 | 완료 |
+| `trading/wallet_bsc.py`, `trading/wallet_solana.py` | 체인별 지갑(서명/잔고/전송) | 완료 |
+| `phantom_tracker.py` | 게이트가 막은 진입의 가상 실현손익 추적(reason별) | 완료 |
 
 ## 체인별 파라미터 (시뮬레이션 도출 최적값)
 
@@ -69,9 +72,39 @@ TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 ```
 
+## 실거래 전환 (페이퍼 ↔ 라이브)
+
+실거래 코드는 완비. 기동 시 모드는 `.env`로 결정 (`orchestrator.py:1793-1802`):
+
+```
+# 페이퍼(현재 기본) — 신호 로깅만, 체결 안 함
+DRY_RUN=true
+TRADING_MODE=dry_run
+
+# 실거래 ON
+DRY_RUN=false
+TRADING_MODE=live
+WALLET_PRIVATE_KEY=<지갑키>   # 이미 세팅됨
+```
+
+**포지션 사이즈 = 체인별 고정 달러액(% 아님, 캡이 우선)**. 소액 실거래 시 작게:
+
+```
+TOTAL_CAPITAL_USD=500
+MAX_POSITION_SIZE_USD=50          # 전역 기본 캡
+BSC_POSITION_SIZE_USD=100        # 체인별 1건 금액
+BASE_POSITION_SIZE_USD=50
+SOLANA_POSITION_SIZE_USD=30
+BASE_MAX_OPEN_POSITIONS=4        # base 동시보유 override(노출 제한)
+```
+
+- 첫 실거래는 `*_POSITION_SIZE_USD`를 $5~10으로 낮춰 1건 체결 → 슬리피지/가스 실측 후 점진 확대.
+- 변경 후 **bat 재시작** 필요(기동 시 1회 로드).
+- ⚠️ 실거래 전 권장: 페이퍼/팬텀(`phantom_report.py`)으로 +EV 확인. 현재 6월 페이퍼는 본전권(누적 적자).
+
 ## 중요 맥락
 
-1. **이 시스템은 시그널 생성까지만**. 실제 swap 트랜잭션은 수동 또는 Module 4 추가 필요.
+1. **실거래 코드 완비**. Module 4(`trading/executor.py` + dex/wallet)가 진입/청산 swap을 실제 체결. 페이퍼↔실거래는 `.env`의 `DRY_RUN`/`TRADING_MODE`로만 전환 (아래 "실거래 전환" 참고). 현재 기본은 페이퍼(`DRY_RUN=true`).
 2. **스크래핑 경로 우선순위**: Binance 내부 API → Playwright → Dexscreener (fallback).
 3. **데이터 축적**: `data/` 폴더에 JSONL로 시계열 누적. Divergence 엔진은 최소 2주치 데이터 필요.
 4. **Safety Gate**: 유동성 / 거래수 / 이미 급등 여부 등 3중 필터.
@@ -79,11 +112,11 @@ TELEGRAM_CHAT_ID=
 
 ## 다음 작업 (우선순위)
 
-- [ ] VPS/Windows 환경 세팅 완료
-- [ ] 2주 페이퍼 트레이딩 데이터 수집
-- [ ] Divergence Engine (Module 2) 구현 — Perception vs Fundamental 괴리 측정
+- [x] VPS/Windows 환경 세팅 완료
+- [x] Divergence Engine (Module 2) v1 — 구현 + 라이브 게이트화(2026-06-21)
+- [x] 실제 swap executor (Module 4) — 구현 완료(trading/executor.py + dex/wallet)
+- [ ] 페이퍼/팬텀으로 엣지(+EV) 증명 후 소액 실거래 전환
 - [ ] Solana 스크래퍼 추가
-- [ ] 실제 swap executor (Module 4) 구현
 
 ## 현재 작업 관행
 
