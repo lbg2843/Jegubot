@@ -116,6 +116,15 @@ SHADOW_RULES = {
         'description': 'REVERT canary: re-allow div<-0.25 entries that live gate now blocks',
         'divergence_block_below': None,  # env override sentinel -> 라이브 div 차단 끄고 게이트 통과
     },
+    # 실험(2026-06-23): ETH 레짐 재검증 — 라이브 게이트는 eth_4h_down 을 막지만, 실측은
+    # 정반대였다. 4h 레짐별 전체 진입(n201): down 53%승/+0.14, flat 48%/+2.37 로 괜찮고
+    # up 37%/-0.88, strong_up 40%/-1.64 가 패자. base 만 보면 strong_up -2.97%(n7) 로 최악.
+    # 즉 막아야 할 건 down 이 아니라 (strong_)up. e/f 가 up·up+strong 을 보지만 strong_up
+    # 단독(가장 정밀한 손실 슬라이스) arm 이 없어 추가. 주말에 e/f/t 비교 후 게이트 방향 결정.
+    'shadow_t_block_eth_strong_up': {
+        'description': 'block entries when ETH 4h regime == strong_up (최정밀 손실 슬라이스)',
+        'block_eth_regimes': ['strong_up'],
+    },
 }
 
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'shadow_decisions.jsonl'
