@@ -125,6 +125,14 @@ SHADOW_RULES = {
         'description': 'block entries when ETH 4h regime == strong_up (최정밀 손실 슬라이스)',
         'block_eth_regimes': ['strong_up'],
     },
+    # 실험(2026-06-23): Web3 risk_level 검증 — 이미 진입마다 태깅 중(6/19~). 청산표본에서
+    # risk<2 는 +0.38%/46%승인데 risk>=3 는 평균 -3.6%/중앙 -12%(n4). 오늘 -13.6% 터진
+    # PRXVT 도 risk 3. risk_level 은 게이트 후 fetch_token_enrich 로 붙어 cand 엔 없으므로
+    # 라이브 shadow_decisions 엔 안 잡히고(피처 부재 → 통과) 오프라인 리포트에서 평가됨.
+    'shadow_u_block_risk_high': {
+        'description': 'block entries with risk_level >= 3 (Web3 고위험)',
+        'block_if_risk_above': 2,
+    },
 }
 
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'shadow_decisions.jsonl'
@@ -154,7 +162,7 @@ def _current_eth_24h_pct():
 # 게이트 통과 후 진입 피처로 거르는 실험 키들(파라미터 override 가 아님).
 _POST_GATE_KEYS = ('block_eth_regimes', 'block_if_pc1h_above', 'allow_pc1h_range', 'allow_utc_hours',
                    'block_if_score_below', 'block_if_eth24h_below', 'block_if_divergence_below',
-                   'block_if_vol1h_above', 'block_if_pool_age_above')
+                   'block_if_vol1h_above', 'block_if_pool_age_above', 'block_if_risk_above')
 
 
 def _divergence_of(token_dict):
@@ -248,6 +256,12 @@ def _post_gate_block_reason(token_dict: dict, overrides: dict):
         age = _pool_age(token_dict)
         if age is not None and age > overrides['block_if_pool_age_above']:
             return f'pool_age_above_{overrides["block_if_pool_age_above"]:.0f}({age:.0f})'
+
+    if 'block_if_risk_above' in overrides:
+        # risk_level 은 게이트 후 enrich 라 cand 엔 보통 없음 → 부재 시 통과(안전 패스스루)
+        rl = token_dict.get('risk_level')
+        if isinstance(rl, (int, float)) and rl > overrides['block_if_risk_above']:
+            return f'risk_above_{overrides["block_if_risk_above"]}({rl})'
     return None
 
 
