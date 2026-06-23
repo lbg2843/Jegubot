@@ -26,9 +26,20 @@ W3_HEADERS = {
 CHAIN_ID = {"bsc": "56", "bnb": "56", "base": "8453", "solana": "CT_501"}
 
 
+def _num(v, as_int: bool = False):
+    """API 가 문자열로 주는 숫자('3730', '72.24')를 float/int 로. 실패 시 None."""
+    if isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return int(f) if as_int else f
+
+
 def fetch_token_enrich(chain: str, contract: str, timeout: int = 10) -> dict:
     """Web3 API 로 holders/집중도/risk 조회. contract 정확매칭. 실패/없음 시 {}.
-    반환: {holders, holders_top10_pct, risk_level} (있는 키만)."""
+    반환: {holders, holders_top10_pct, risk_level} (있는 키만, 숫자형)."""
     cid = CHAIN_ID.get(str(chain).lower())
     if not cid or not contract:
         return {}
@@ -43,13 +54,15 @@ def fetch_token_enrich(chain: str, contract: str, timeout: int = 10) -> dict:
         for t in rows:
             if str(t.get("contractAddress", "")).lower() == tgt:
                 out = {}
+                # API 가 holders/holdersTop10Percent 를 문자열로 줘서 숫자 분석이 죄다
+                # 누락됐었음(2026-06-23 발견). 여기서 숫자로 강제 캐스팅해 저장.
                 if t.get("holders") is not None:
-                    out["holders"] = t.get("holders")
+                    out["holders"] = _num(t.get("holders"), as_int=True)
                 if t.get("holdersTop10Percent") is not None:
-                    out["holders_top10_pct"] = t.get("holdersTop10Percent")
+                    out["holders_top10_pct"] = _num(t.get("holdersTop10Percent"))
                 if t.get("riskLevel") is not None:
-                    out["risk_level"] = t.get("riskLevel")
-                return out
+                    out["risk_level"] = _num(t.get("riskLevel"), as_int=True)
+                return {k: v for k, v in out.items() if v is not None}
     except Exception as exc:  # noqa: BLE001
         log.debug("web3 enrich 실패 %s: %s", str(contract)[:12], exc)
     return {}

@@ -46,6 +46,15 @@ def _parse(x):
         return None
 
 
+def _coerce_num(v):
+    if isinstance(v, bool):
+        return None
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _pc1h(e):
     for k in ("pc_1h", "price_change_1h_pct", "price_change_1h"):
         v = e.get(k)
@@ -83,6 +92,7 @@ def load_entries(since):
             "vol_1h_usd": r.get("vol_1h_usd"),
             "pool_age_hours": r.get("pool_age_hours"),
             "risk_level": r.get("risk_level"),
+            "holders": _coerce_num(r.get("holders")),  # 구데이터는 문자열 → 숫자화
         })
     return out
 
@@ -211,6 +221,12 @@ def arm_blocks(overrides, e):
         if not isinstance(rl, (int, float)):
             return False, False  # risk_level 미태깅 → 평가 불가
         return rl > overrides["block_if_risk_above"], True
+
+    if "block_if_holders_below" in overrides:
+        h = e.get("holders")
+        if not isinstance(h, (int, float)):
+            return False, False  # holders 미태깅 → 평가 불가
+        return h < overrides["block_if_holders_below"], True
 
     # vol_1h / pool_age (단일 또는 결합=OR). 하나라도 피처 있으면 평가 가능.
     if "block_if_vol1h_above" in overrides or "block_if_pool_age_above" in overrides:

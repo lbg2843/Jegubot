@@ -133,6 +133,15 @@ SHADOW_RULES = {
         'description': 'block entries with risk_level >= 3 (Web3 고위험)',
         'block_if_risk_above': 2,
     },
+    # 실험(2026-06-23): 홀더수 — 직관과 정반대 발견. 청산표본(n43)에서 홀더 2k-5k 는
+    # -3.5%/31%승인데 >=5k 는 +2.5%/58%승. 고집중(top10>=70%)도 +2.0% 로 오히려 우세.
+    # 가설: base 트렌딩에선 홀더 많고 강한손이 쥔 established 토큰이 이기고 어정쩡한
+    # 신생(2k-5k)이 짐. holders 도 enrich(게이트 후)라 오프라인 리포트에서만 평가.
+    # 관찰용 — 주말에 표본 늘면 방향(저홀더 차단) 확정 여부 판단.
+    'shadow_v_block_low_holders': {
+        'description': 'block entries with holders < 5000 (저홀더=어정쩡한 신생)',
+        'block_if_holders_below': 5000,
+    },
 }
 
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'shadow_decisions.jsonl'
@@ -162,7 +171,8 @@ def _current_eth_24h_pct():
 # 게이트 통과 후 진입 피처로 거르는 실험 키들(파라미터 override 가 아님).
 _POST_GATE_KEYS = ('block_eth_regimes', 'block_if_pc1h_above', 'allow_pc1h_range', 'allow_utc_hours',
                    'block_if_score_below', 'block_if_eth24h_below', 'block_if_divergence_below',
-                   'block_if_vol1h_above', 'block_if_pool_age_above', 'block_if_risk_above')
+                   'block_if_vol1h_above', 'block_if_pool_age_above', 'block_if_risk_above',
+                   'block_if_holders_below')
 
 
 def _divergence_of(token_dict):
@@ -262,6 +272,15 @@ def _post_gate_block_reason(token_dict: dict, overrides: dict):
         rl = token_dict.get('risk_level')
         if isinstance(rl, (int, float)) and rl > overrides['block_if_risk_above']:
             return f'risk_above_{overrides["block_if_risk_above"]}({rl})'
+
+    if 'block_if_holders_below' in overrides:
+        h = token_dict.get('holders')
+        try:
+            h = float(h) if h is not None else None
+        except (TypeError, ValueError):
+            h = None
+        if h is not None and h < overrides['block_if_holders_below']:
+            return f'holders_below_{overrides["block_if_holders_below"]}({h:.0f})'
     return None
 
 

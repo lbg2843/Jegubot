@@ -725,6 +725,17 @@ class Orchestrator:
             except Exception as e:
                 log.warning(f"[phantom] init failed (disabled): {e}")
 
+        # holder tracker: 오픈 포지션 홀더수 시계열 기록(홀더 증가율=reflexivity 분석용).
+        # 라이브 0 영향. HOLDER_TRACK_ENABLED=0 으로 끔.
+        self.holder_tracker = None
+        if os.getenv("HOLDER_TRACK_ENABLED", "1") == "1":
+            try:
+                from holder_tracker import HolderTracker
+                self.holder_tracker = HolderTracker()
+                log.info("[holder] tracker on (interval=%dm)", self.holder_tracker.interval_min)
+            except Exception as e:
+                log.warning(f"[holder] init failed (disabled): {e}")
+
         self.last_scrape: dict[str, float] = {"bsc": 0, "solana": 0, "base": 0}
         self.last_summary_bucket: str | None = None
         self.last_dashboard_bucket: str | None = None
@@ -1232,6 +1243,11 @@ class Orchestrator:
                 self.phantom.update(snapshots_by_chain)
             except Exception as e:
                 log.warning(f"[phantom] update error (continuing): {e}")
+        if self.holder_tracker is not None:
+            try:
+                self.holder_tracker.track(self.pm.positions.values())
+            except Exception as e:
+                log.warning(f"[holder] track error (continuing): {e}")
         self._write_heartbeat("after_position_update", exit_count=len(exits))
         for pos, reason, msg in exits:
             current_price = pos.current_price
