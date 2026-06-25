@@ -484,6 +484,34 @@ def passes_safety_gate(token_dict: dict, chain: str) -> tuple[bool, str]:
             log.info(f"[{chain}] GATE FAIL {symbol}: divergence={_ds:+.3f} < {_floor:+.2f} (과열 차단)")
             return False, f"divergence_below_{_floor}({_ds:+.3f})"
 
+    # holders 게이트 (배관 준비 2026-06-25, 기본 OFF). shadow_v(holders<5000)이 CI 통과
+    # (d_mean +2.46, CI[+0.24,+4.82])해 주말 승격 후보. holders 는 web3 enrich(원래 게이트
+    # 후 로깅용)라 여기서 lazy fetch(캐시)해 게이트 시점에 확보. HOLDERS_BLOCK_BELOW 세팅
+    # 시에만 활성 — 미설정이면 enrich 호출조차 안 해 현행과 100% 동일(= shadow 유지).
+    _holders_floor = os.getenv("HOLDERS_BLOCK_BELOW", "").strip()
+    if _holders_floor:
+        try:
+            _hfloor = float(_holders_floor)
+        except ValueError:
+            _hfloor = None
+        if _hfloor is not None:
+            _h = token_dict.get("holders")
+            if _h is None:
+                try:
+                    from web3_client import fetch_token_enrich
+                    _enr = fetch_token_enrich(chain, token_dict.get("contract_address"))
+                    token_dict.update(_enr)  # cand 에 머지 → 이후 로깅/평가서 재사용(캐시로 추가호출 X)
+                    _h = _enr.get("holders")
+                except Exception:
+                    _h = None
+            try:
+                _h = float(_h) if _h is not None else None
+            except (TypeError, ValueError):
+                _h = None
+            if _h is not None and _h < _hfloor:
+                log.info(f"[{chain}] GATE FAIL {symbol}: holders={_h:.0f} < {_hfloor:.0f} (저홀더 차단)")
+                return False, f"holders_below_{_hfloor:.0f}({_h:.0f})"
+
     return True, "ok"
 
 

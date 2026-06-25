@@ -10,11 +10,18 @@ divergence(Module 2)의 빠진 조각 = 홀더. 진입마다 enrich·태깅 → 
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import Optional
 
 import requests
 
 log = logging.getLogger("web3_client")
+
+# enrich 캐시: 게이트가 후보·shadow arm 마다 호출해도 TTL 안엔 API 1회.
+# holder_tracker 는 20분 간격 폴이라 TTL(기본 300s)보다 길어 항상 신선값.
+_ENRICH_CACHE: dict[tuple, tuple] = {}
+_CACHE_TTL = float(os.getenv("WEB3_ENRICH_CACHE_TTL_SEC", "300") or 300)
 
 W3_SEARCH = "https://web3.binance.com/bapi/defi/v5/public/wallet-direct/buw/wallet/market/token/search"
 W3_HEADERS = {
@@ -38,8 +45,22 @@ def _num(v, as_int: bool = False):
 
 
 def fetch_token_enrich(chain: str, contract: str, timeout: int = 10) -> dict:
-    """Web3 API 로 holders/집중도/risk 조회. contract 정확매칭. 실패/없음 시 {}.
+    """Web3 API 로 holders/집중도/risk 조회(TTL 캐시). 실패/없음 시 {}.
     반환: {holders, holders_top10_pct, risk_level} (있는 키만, 숫자형)."""
+    key = (str(chain).lower(), str(contract).lower())
+    now = time.monotonic()
+    hit = _ENRICH_CACHE.get(key)
+    if hit is not None and (now - hit[0]) < _CACHE_TTL:
+        return hit[1]
+    res = _fetch_token_enrich_uncached(chain, contract, timeout)
+    if len(_ENRICH_CACHE) > 2000:  # 무한증식 방지: 만료분 정리
+        for k in [k for k, v in _ENRICH_CACHE.items() if (now - v[0]) >= _CACHE_TTL]:
+            _ENRICH_CACHE.pop(k, None)
+    _ENRICH_CACHE[key] = (now, res)
+    return res
+
+
+def _fetch_token_enrich_uncached(chain: str, contract: str, timeout: int = 10) -> dict:
     cid = CHAIN_ID.get(str(chain).lower())
     if not cid or not contract:
         return {}
