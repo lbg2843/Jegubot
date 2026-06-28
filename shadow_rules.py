@@ -142,6 +142,14 @@ SHADOW_RULES = {
         'description': 'block entries with holders < 5000 (저홀더=어정쩡한 신생)',
         'block_if_holders_below': 5000,
     },
+    # 실험(2026-06-29): Surf onchain 붐빔도. 프로브 n24 — 패자=신생인데 매수자 폭발(빠른
+    # 펌프 추격, buyers_per_day 중앙 ~18), 승자=오래됐는데 매수자 적음(잠수함, ~4).
+    # "안 쫓기"의 정밀판. surf_buyers_per_day 는 진입한 토큰만 Surf 쿼리로 태깅(게이트 후) →
+    # 라이브 shadow 엔 피처부재로 통과, 오프라인 리포트에서 평가. 3일 포워드 검증용.
+    'shadow_w_block_crowded': {
+        'description': 'block entries with surf buyers_per_day > 20 (붐비는 펌프 추격)',
+        'block_if_buyers_per_day_above': 20,
+    },
 }
 
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'shadow_decisions.jsonl'
@@ -172,7 +180,7 @@ def _current_eth_24h_pct():
 _POST_GATE_KEYS = ('block_eth_regimes', 'block_if_pc1h_above', 'allow_pc1h_range', 'allow_utc_hours',
                    'block_if_score_below', 'block_if_eth24h_below', 'block_if_divergence_below',
                    'block_if_vol1h_above', 'block_if_pool_age_above', 'block_if_risk_above',
-                   'block_if_holders_below')
+                   'block_if_holders_below', 'block_if_buyers_per_day_above')
 
 
 def _divergence_of(token_dict):
@@ -281,6 +289,11 @@ def _post_gate_block_reason(token_dict: dict, overrides: dict):
             h = None
         if h is not None and h < overrides['block_if_holders_below']:
             return f'holders_below_{overrides["block_if_holders_below"]}({h:.0f})'
+
+    if 'block_if_buyers_per_day_above' in overrides:
+        bpd = token_dict.get('surf_buyers_per_day')
+        if isinstance(bpd, (int, float)) and bpd > overrides['block_if_buyers_per_day_above']:
+            return f'buyers_per_day_above_{overrides["block_if_buyers_per_day_above"]}({bpd:.0f})'
     return None
 
 

@@ -93,6 +93,7 @@ def load_entries(since):
             "pool_age_hours": r.get("pool_age_hours"),
             "risk_level": r.get("risk_level"),
             "holders": _coerce_num(r.get("holders")),  # 구데이터는 문자열 → 숫자화
+            "surf_buyers_per_day": r.get("surf_buyers_per_day"),
         })
     return out
 
@@ -227,6 +228,12 @@ def arm_blocks(overrides, e):
         if not isinstance(h, (int, float)):
             return False, False  # holders 미태깅 → 평가 불가
         return h < overrides["block_if_holders_below"], True
+
+    if "block_if_buyers_per_day_above" in overrides:
+        bpd = e.get("surf_buyers_per_day")
+        if not isinstance(bpd, (int, float)):
+            return False, False  # surf 미태깅 → 평가 불가
+        return bpd > overrides["block_if_buyers_per_day_above"], True
 
     # vol_1h / pool_age (단일 또는 결합=OR). 하나라도 피처 있으면 평가 가능.
     if "block_if_vol1h_above" in overrides or "block_if_pool_age_above" in overrides:

@@ -1381,6 +1381,13 @@ class Orchestrator:
                     eth_extra.update(fetch_token_enrich(chain, cand.get("contract_address")))
                 except Exception:
                     pass
+                # Surf onchain 붐빔도(매수자/일) — '안 쫓기' 정밀판. 진입한 토큰만 측정(유료, 캡有).
+                # 측정 전용 → shadow_w 로 포워드 검증(2026-06-29~ 3일). 거래엔 0 영향.
+                try:
+                    from surf_client import fetch_token_crowding
+                    eth_extra.update(fetch_token_crowding(chain, cand.get("contract_address")))
+                except Exception:
+                    pass
                 if self.executor:
                     signal = self._build_trade_signal(cand, chain)
                     result = self.executor.submit_entry_signal(signal)
